@@ -1,5 +1,35 @@
-node_modules
-dist
-release
-*.log
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+release/
+*.exe
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.python_service/data/
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
