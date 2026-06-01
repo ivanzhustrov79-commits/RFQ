@@ -1,0 +1,186 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* ============ DARK THEME (default) ============ */
+  :root {
+    --brand-plum: #6B3D8B;
+    --brand-plum-light: #8B5DAF;
+    --deep-plum-bg: #210B35;
+    --plum-accent: #9B5BAF;
+    --amber-alert: #F5A623;
+    --red-urgent: #E74C3C;
+    --green-success: #2ECC71;
+    --blue-ci: #3498DB;
+    --dark-bg: #130A1B;
+    --card-bg: #1D1127;
+    --column-bg: #17101F;
+    --border-color: #2D1F3F;
+    --border-light: #3D2D55;
+    --text-primary: #FFFFFF;
+    --text-secondary: #B8A5C5;
+    --text-tertiary: #7B6B8A;
+    --header-bg: #2A1D39;
+    --analytics-bg: #191121;
+    --kpi-strip-bg: #1A0D2A;
+
+    /* Font size scale - MEDIUM (default) */
+    --fs-display: 20px;
+    --fs-h1: 16px;
+    --fs-h2: 14px;
+    --fs-body: 14px;
+    --fs-small: 13px;
+    --fs-micro: 11px;
+    --fs-kpi: 26px;
+
+    --radius: 0.5rem;
+  }
+
+  /* ============ LIGHT THEME ============ */
+  .theme-light {
+    --brand-plum: #5A2D7A;
+    --brand-plum-light: #7B4D9F;
+    --deep-plum-bg: #F5F0F8;
+    --plum-accent: #7B4D9F;
+    --amber-alert: #E09512;
+    --red-urgent: #D43A2C;
+    --green-success: #27AE60;
+    --blue-ci: #2980B9;
+    --dark-bg: #EDE8F2;
+    --card-bg: #FFFFFF;
+    --column-bg: #F0EBF5;
+    --border-color: #D0C5DB;
+    --border-light: #B8ACC5;
+    --text-primary: #1A0A2E;
+    --text-secondary: #5A4A6A;
+    --text-tertiary: #8A7A9A;
+    --header-bg: #E2D9EB;
+    --analytics-bg: #F5F0FA;
+    --kpi-strip-bg: #E8E0F0;
+  }
+
+  /* ============ FONT SIZE: SMALL ============ */
+  .font-small {
+    --fs-display: 16px;
+    --fs-h1: 13px;
+    --fs-h2: 12px;
+    --fs-body: 12px;
+    --fs-small: 11px;
+    --fs-micro: 9px;
+    --fs-kpi: 20px;
+  }
+
+  /* ============ FONT SIZE: MEDIUM ============ */
+  .font-medium {
+    --fs-display: 20px;
+    --fs-h1: 16px;
+    --fs-h2: 14px;
+    --fs-body: 14px;
+    --fs-small: 13px;
+    --fs-micro: 11px;
+    --fs-kpi: 26px;
+  }
+
+  /* ============ FONT SIZE: BIG ============ */
+  .font-big {
+    --fs-display: 24px;
+    --fs-h1: 19px;
+    --fs-h2: 17px;
+    --fs-body: 16px;
+    --fs-small: 15px;
+    --fs-micro: 13px;
+    --fs-kpi: 32px;
+  }
+
+  * {
+    border-color: var(--border-color);
+  }
+
+  body {
+    background-color: var(--dark-bg);
+    color: var(--text-primary);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow: hidden;
+    font-size: var(--fs-body);
+  }
+
+  /* Font size utility classes */
+  .text-display { font-size: var(--fs-display); }
+  .text-h1 { font-size: var(--fs-h1); }
+  .text-h2 { font-size: var(--fs-h2); }
+  .text-body { font-size: var(--fs-body); }
+  .text-small { font-size: var(--fs-small); }
+  .text-micro { font-size: var(--fs-micro); }
+  .text-kpi { font-size: var(--fs-kpi); }
+
+  /* Custom thin scrollbar */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 5px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: var(--brand-plum);
+    border-radius: 3px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: var(--brand-plum-light);
+  }
+
+  /* Typing indicator animation */
+  @keyframes typing-dot {
+    0%, 60%, 100% { transform: scale(1); opacity: 0.4; }
+    30% { transform: scale(1.3); opacity: 1; }
+  }
+  .typing-dot {
+    animation: typing-dot 1.4s ease-in-out infinite;
+  }
+  .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+  /* Pulse animation for low confidence */
+  @keyframes pulse-low-confidence {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 0.85; }
+  }
+  .pulse-low-confidence {
+    animation: pulse-low-confidence 2s ease-in-out infinite;
+  }
+
+  /* Provisional dot pulse */
+  @keyframes pulse-provisional {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.3); }
+  }
+  .pulse-provisional {
+    animation: pulse-provisional 1.5s ease-in-out infinite;
+  }
+
+  /* Drag handle dot pattern */
+  .drag-handle {
+    background-image: radial-gradient(circle, var(--text-tertiary) 1px, transparent 1px);
+    background-size: 4px 4px;
+    width: 12px;
+    height: 24px;
+    opacity: 0;
+    transition: opacity 150ms ease;
+  }
+  .email-card:hover .drag-handle {
+    opacity: 0.5;
+  }
+
+  /* Transition utilities */
+  .duration-250 { transition-duration: 250ms; }
+
+  /* Gradient borders for column headers */
+  .column-header-gradient-0 { border-left: 4px solid; border-image: linear-gradient(to bottom, #3498DB, #2980B9) 1; }
+  .column-header-gradient-1 { border-left: 4px solid; border-image: linear-gradient(to bottom, #9B5BAF, #7B3F9B) 1; }
+  .column-header-gradient-2 { border-left: 4px solid; border-image: linear-gradient(to bottom, #2ECC71, #27AE60) 1; }
+  .column-header-gradient-3 { border-left: 4px solid; border-image: linear-gradient(to bottom, #F5A623, #E8941F) 1; }
+  .column-header-gradient-4 { border-left: 4px solid; border-image: linear-gradient(to bottom, #E67E22, #D35400) 1; }
+  .column-header-gradient-5 { border-left: 4px solid; border-image: linear-gradient(to bottom, #2ECC71, #1ABC9C) 1; }
+}

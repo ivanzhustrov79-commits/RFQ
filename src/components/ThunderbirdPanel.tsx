@@ -1,0 +1,313 @@
+// @ts-nocheck
+import { useApp } from '@/context/AppContext';
+import { useState } from 'react';
+import { X, Mail, RefreshCw, AlertCircle, FolderOpen, ChevronDown, ChevronRight, Inbox, Check } from 'lucide-react';
+
+interface MboxFile {
+  name: string;
+  path: string;
+  size: number;
+  emailCount: number;
+}
+
+interface FolderNode {
+  name: string;
+  path: string;
+  grey: boolean;
+  children: FolderNode[];
+  mboxes: MboxFile[];
+  mboxCount: number;
+}
+
+interface AccountTree {
+  name: string;
+  type: string;
+  children: FolderNode[];
+  totalEmails: number;
+}
+
+interface ProfileData {
+  name: string;
+  path: string;
+  trees: AccountTree[];
+  totalEmails: number;
+}
+
+export function ThunderbirdPanel() {
+  const { state, dispatch } = useApp();
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [expandedAccounts, setExpandedAccounts] = useState<Set<string>>(new Set());
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+  const [loadingMbox, setLoadingMbox] = useState<string | null>(null);
+
+  const handleClose = () => { dispatch({ type: 'TOGGLE_THUNDERBIRD_PANEL' }); };
+
+  const handleDiscover = async () => {
+    setScanning(true);
+    setError(null);
+    try {
+      const result = await window.electronAPI.thunderbird.discover();
+      if (result && result.profiles) {
+        dispatch({ type: 'SET_THUNDERBIRD_DATA', payload: result });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Discover failed');
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  const toggleAccount = (key: string) => {
+    setExpandedAccounts(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  };
+
+  const toggleFolder = (key: string) => {
+    setExpandedFolders(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  };
+
+  const handleToggleSync = (syncKey: string, mboxPath?: string) => {
+    const isCurrentlySynced = state.syncedFolders.has(syncKey);
+    if (isCurrentlySynced) {
+      dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
+      return;
+    }
+    if (mboxPath) {
+      handleReadMbox(mboxPath, syncKey);
+    } else {
+      dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
+    }
+  };
+
+  const handleReadMbox = async (mboxPath: string, syncKey: string) => {
+    setLoadingMbox(mboxPath);
+    setError(null);
+    try {
+      const result = await window.electronAPI.thunderbird.readMbox(mboxPath, 100);
+      if (result.success && result.emails) {
+        dispatch({ type: 'SET_REAL_EMAILS', payload: result.emails });
+        dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
+        if (!state.useRealData) dispatch({ type: 'TOGGLE_DATA_SOURCE' });
+      } else {
+        setError(result.error || 'Failed to read MBOX');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to read');
+    } finally {
+      setLoadingMbox(null);
+    }
+  };
+
+  if (!state.isThunderbirdPanelOpen) return null;
+
+  return (
+    <>
+      <div className="fixed inset-0 z-[80]" style={{ backgroundColor: 'black', opacity: 0.6 }} onClick={handleClose} />
+      <div className="fixed left-0 top-0 bottom-0 w-[420px] z-[90] flex flex-col"
+        style={{ backgroundColor: 'var(--deep-plum-bg)', borderRight: '1px solid var(--border-color)', boxShadow: '4px 0 24px rgba(0,0,0,0.6)' }}>
+
+        <div className="flex items-center justify-between px-4 h-12 shrink-0" style={{ borderBottom: '1px solid var(--border-color)' }}>
+          <div className="flex items-center gap-2">
+            <Mail className="w-5 h-5" style={{ color: 'var(--plum-accent)' }} />
+            <h2 className="text-h1 font-semibold" style={{ color: 'var(--text-primary)' }}>Thunderbird</h2>
+          </div>
+          <div className="flex items-center gap-1">
+            <button onClick={handleDiscover} disabled={scanning} className="p-1.5 rounded-md hover:bg-white/10 disabled:opacity-40" title="Rescan">
+              <RefreshCw className={`w-4 h-4 ${scanning ? 'animate-spin' : ''}`} style={{ color: 'var(--text-secondary)' }} />
+            </button>
+            <button onClick={handleClose} className="p-1.5 rounded-md hover:bg-white/10" title="Close">
+              <X className="w-5 h-5" style={{ color: 'var(--text-secondary)' }} />
+            </button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto custom-scrollbar py-2">
+          {!state.thunderbirdData && !scanning && (
+            <div className="flex flex-col items-center justify-center py-16 px-4">
+              <Mail className="w-12 h-12 mb-4" style={{ color: 'var(--text-tertiary)' }} />
+              <p className="text-body font-medium mb-4" style={{ color: 'var(--text-secondary)' }}>No Thunderbird data</p>
+              <button onClick={handleDiscover} className="flex items-center gap-2 px-4 py-2 rounded-md text-small font-medium" style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}>
+                <RefreshCw className="w-4 h-4" /> Scan Thunderbird
+              </button>
+            </div>
+          )}
+
+          {scanning && (
+            <div className="flex flex-col items-center justify-center py-16">
+              <RefreshCw className="w-8 h-8 animate-spin mb-3" style={{ color: 'var(--plum-accent)' }} />
+              <p className="text-body" style={{ color: 'var(--text-secondary)' }}>Scanning...</p>
+            </div>
+          )}
+
+          {error && (
+            <div className="mx-3 p-3 rounded-md mb-2 flex items-start gap-2" style={{ backgroundColor: 'rgba(231,76,60,0.1)', border: '1px solid rgba(231,76,60,0.3)' }}>
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" style={{ color: 'var(--red-urgent)' }} />
+              <p className="text-small" style={{ color: 'var(--red-urgent)' }}>{error}</p>
+            </div>
+          )}
+
+          {loadingMbox && (
+            <div className="mx-3 p-2 rounded-md mb-2 flex items-center gap-2" style={{ backgroundColor: 'rgba(107,61,139,0.2)', border: '1px solid rgba(107,61,139,0.4)' }}>
+              <RefreshCw className="w-3 h-3 animate-spin" style={{ color: 'var(--plum-accent)' }} />
+              <p className="text-small" style={{ color: 'var(--plum-accent)' }}>Loading emails...</p>
+            </div>
+          )}
+
+          {state.thunderbirdData && Array.isArray(state.thunderbirdData.profiles) && state.thunderbirdData.profiles.map((profile: ProfileData, pIdx: number) => (
+            <div key={pIdx} className="mb-2">
+              <div className="px-3 py-1 text-micro font-semibold uppercase tracking-wide" style={{ color: 'var(--text-tertiary)' }}>
+                {profile.name}
+              </div>
+              {Array.isArray(profile.trees) && profile.trees.map((tree: AccountTree, aIdx: number) => {
+                const key = `a-${pIdx}-${aIdx}`;
+                const isExpanded = expandedAccounts.has(key);
+                const accountName = tree.name || 'Unknown';
+                return (
+                  <div key={key}>
+                    <button onClick={() => toggleAccount(key)} className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-white/5">
+                      {isExpanded
+                        ? <ChevronDown className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+                        : <ChevronRight className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />}
+                      <FolderOpen className="w-4 h-4 shrink-0" style={{ color: 'var(--plum-accent)' }} />
+                      <span className="text-small flex-1 truncate" style={{ color: 'var(--text-primary)' }}>{accountName}</span>
+                      <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>
+                        {tree.totalEmails > 999 ? (tree.totalEmails/1000).toFixed(1) + 'k' : tree.totalEmails}
+                      </span>
+                    </button>
+                    {isExpanded && Array.isArray(tree.children) && tree.children.map((folder: FolderNode, fIdx: number) => (
+                      <FolderNodeComp
+                        key={`${key}-f${fIdx}`}
+                        folder={folder}
+                        depth={0}
+                        syncKeyPrefix={`${profile.name}/${accountName}`}
+                        expandedFolders={expandedFolders}
+                        syncedFolders={state.syncedFolders}
+                        onToggle={toggleFolder}
+                        onReadMbox={handleReadMbox}
+                        onToggleSync={handleToggleSync}
+                        loadingMbox={loadingMbox}
+                      />
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function FolderNodeComp({
+  folder,
+  depth,
+  syncKeyPrefix,
+  expandedFolders,
+  syncedFolders,
+  onToggle,
+  onReadMbox,
+  onToggleSync,
+  loadingMbox,
+}: {
+  folder: FolderNode;
+  depth: number;
+  syncKeyPrefix: string;
+  expandedFolders: Set<string>;
+  syncedFolders: Set<string>;
+  onToggle: (k: string) => void;
+  onReadMbox: (p: string, k: string) => void;
+  onToggleSync: (sk: string, mp?: string) => void;
+  loadingMbox: string | null;
+}) {
+  if (!folder || typeof folder !== 'object') return null;
+
+  const key = (folder.path || 'nopath') + '/' + folder.name;
+  const syncKey = syncKeyPrefix + '/' + key;
+  const isExpanded = expandedFolders.has(key);
+  const isSynced = syncedFolders.has(syncKey);
+  const children = Array.isArray(folder.children) ? folder.children : [];
+  const hasChildren = children.length > 0;
+  const mboxes = Array.isArray(folder.mboxes) ? folder.mboxes : [];
+  const hasMboxes = mboxes.length > 0;
+  const isGrey = !!folder.grey;
+  const name = folder.name || '?';
+  const count = folder.mboxCount || 0;
+  const isLoading = loadingMbox && mboxes.some(m => m.path === loadingMbox);
+
+  const handleExpandToggle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (hasChildren) onToggle(key);
+  };
+
+  const handleFolderClick = () => {
+    if (isGrey) return;
+    if (isSynced) {
+      onToggleSync(syncKey);
+    } else if (hasChildren) {
+      onToggleSync(syncKey, hasMboxes && mboxes[0] ? mboxes[0].path : undefined);
+    } else if (hasMboxes && mboxes[0]) {
+      onReadMbox(mboxes[0].path, syncKey);
+    }
+  };
+
+  return (
+    <div>
+      <button
+        onClick={handleFolderClick}
+        className="w-full flex items-center gap-1.5 text-left hover:bg-white/5"
+        style={{
+          paddingLeft: `${12 + depth * 16}px`,
+          paddingRight: '12px',
+          paddingTop: '2px',
+          paddingBottom: '2px',
+          opacity: isGrey ? 0.35 : 1,
+          cursor: isGrey ? 'default' : 'pointer',
+        }}
+      >
+        {hasChildren ? (
+          isExpanded
+            ? <ChevronDown className="w-3 h-3 shrink-0" style={{ color: 'var(--text-tertiary)' }} onClick={handleExpandToggle} />
+            : <ChevronRight className="w-3 h-3 shrink-0" style={{ color: 'var(--text-tertiary)' }} onClick={handleExpandToggle} />
+        ) : (
+          <span className="w-3 shrink-0" />
+        )}
+
+        {isGrey ? (
+          <Mail className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+        ) : isSynced ? (
+          <Check className="w-3.5 h-3.5 shrink-0" style={{ color: '#2ecc71' }} />
+        ) : isLoading ? (
+          <RefreshCw className="w-3.5 h-3.5 shrink-0 animate-spin" style={{ color: 'var(--plum-accent)' }} />
+        ) : (
+          <Inbox className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--plum-accent)' }} />
+        )}
+
+        <span className="text-small flex-1 truncate" style={{ color: isGrey ? 'var(--text-tertiary)' : isSynced ? '#2ecc71' : 'var(--text-secondary)' }}>
+          {name}
+        </span>
+
+        {!isGrey && count > 0 && (
+          <span className="text-micro" style={{ color: isSynced ? '#2ecc71' : 'var(--text-tertiary)' }}>
+            {count > 999 ? (count / 1000).toFixed(1) + 'k' : count}
+          </span>
+        )}
+      </button>
+
+      {isExpanded && hasChildren && children.map((child: FolderNode, i: number) => (
+        <FolderNodeComp
+          key={`${key}-c${i}`}
+          folder={child}
+          depth={depth + 1}
+          syncKeyPrefix={syncKeyPrefix}
+          expandedFolders={expandedFolders}
+          syncedFolders={syncedFolders}
+          onToggle={onToggle}
+          onReadMbox={onReadMbox}
+          onToggleSync={onToggleSync}
+          loadingMbox={loadingMbox}
+        />
+      ))}
+    </div>
+  );
+}
