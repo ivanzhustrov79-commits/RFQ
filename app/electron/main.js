@@ -2,11 +2,165 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
 
 let mainWindow;
 
 const GREY_NAMES = new Set(['sent','drafts','trash','outbox','junk','spam','archive','templates','queue','корзина','черновики','отправленные']);
 const SKIP_FOLDERS = new Set(['news','2026']);
+
+// Accounts/domains to skip (old/junk accounts)
+// User actively uses: commercial@field-pro.ae, izhustrov@europa-parts.kz, izhustrov@import-detal36.ru
+const SKIP_ACCOUNTS = new Set([
+  'eivanova@europa-parts.kz',
+  'eivanova@import-detal36.ru',
+  'eivanova@agro-pro2014.ru',
+  'izhustrov@agro-pro2014.ru',
+  'logistic@import-detal36.ru',
+  'logistic@field-pro.ae',
+  'yandex.com',
+  'pop3.field-pro.ae',
+]);
+
+// ── Python NLP Service Configuration ──
+const PYTHON_HOST = '127.0.0.1';
+const PYTHON_PORT = 8721;
+let pythonAvailable = false;
+
+// HTTP helper to call Python FastAPI service
+function callPython(endpoint, payload, method = 'POST') {
+  return new Promise((resolve, reject) => {
+    const isGet = method === 'GET';
+    const postData = isGet ? '' : JSON.stringify(payload);
+    const options = {
+      hostname: PYTHON_HOST,
+      port: PYTHON_PORT,
+      path: endpoint,
+      method: method,
+      headers: isGet ? {} : {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+      },
+      timeout: 120000, // 120s timeout for LLM calls
+    };
+
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(JSON.parse(data));
+          } else {
+            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+          }
+        } catch (e) {
+          reject(new Error('Invalid JSON response: ' + data.substring(0, 200)));
+        }
+      });
+    });
+
+    req.on('error', (err) => reject(err));
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+    if (!isGet) req.write(postData);
+    req.end();
+  });
+}
+
+// Check if Python service is running (GET request for /health)
+async function checkPython() {
+  try {
+    const result = await callPython('/health', null, 'GET');
+    pythonAvailable = result.status === 'ok';
+    console.log('[PY] Python service ' + (pythonAvailable ? 'AVAILABLE' : 'unhealthy') + ':', result);
+    return pythonAvailable;
+  } catch (err) {
+    pythonAvailable = false;
+    console.log('[PY] Python service NOT available:', err.message);
+    return false;
+  }
+}
+
+// Enrich top N emails with NLP (supplier extraction + step classification)
+// Helper: extract domain from email address like "Name <user@domain.com>" or "user@domain.com"
+function extractDomain(fromField) {
+  if (!fromField) return '';
+  const match = fromField.match(/@([\w.-]+)/);
+  return match ? match[1] : '';
+}
+
+// Enrich top N emails with NLP — ALL emails processed in parallel for speed
+async function enrichEmailsWithNLP(emails, maxEnrich = 2) {
+  if (!pythonAvailable) {
+    console.log('[NLP] Skipping enrichment — Python service not available');
+    return emails;
+  }
+
+  const toEnrich = emails.slice(0, maxEnrich);
+  console.log('[NLP] Enriching top %d of %d emails in PARALLEL...', toEnrich.length, emails.length);
+  const startTime = Date.now();
+
+  // Build all API calls for all emails, then fire them ALL at once
+  const enrichOne = async (email, idx) => {
+    const senderDomain = extractDomain(email.senderEmail || email.from || '');
+    const t0 = Date.now();
+    try {
+      const [extractResult, classifyResult] = await Promise.all([
+        callPython('/nlp/extract-rfq', {
+          email_id: email.id || 0,
+          subject: email.subject || '',
+          body_text: email.body || '',
+          sender_domain: senderDomain,
+        }),
+        callPython('/nlp/classify-step', {
+          email_id: email.id || 0,
+          subject: email.subject || '',
+          body_text: email.body || '',
+          previous_emails_in_thread: [],
+        }),
+      ]);
+      const dt = Date.now() - t0;
+
+      const rawParts = extractResult.extracted?.part_numbers || [];
+      const partStrings = rawParts.map(p => typeof p === 'string' ? p : (p.part_number || p.partNumber || String(p))).filter(Boolean);
+
+      email.extracted = {
+        supplier: extractResult.extracted?.supplier_name || null,
+        partNumbers: partStrings,
+      };
+
+      const suggestedStep = classifyResult.classification?.suggested_step || 0;
+      email.classification = {
+        step: suggestedStep,
+        confidence: classifyResult.classification?.confidence || 0,
+      };
+      if (suggestedStep >= 1 && suggestedStep <= 7) {
+        email.stepAssigned = suggestedStep;
+      }
+
+      console.log('[NLP] Email %d (%dms): supplier="%s", parts=%j, step=%d, conf=%s',
+        idx + 1, dt, email.extracted.supplier || '-', email.extracted.partNumbers,
+        email.classification.step, email.classification.confidence.toFixed(2));
+    } catch (err) {
+      console.log('[NLP] Email %d failed: %s', idx + 1, err.message);
+      email.extracted = { supplier: null, partNumbers: [] };
+      email.classification = { step: 0, confidence: 0 };
+    }
+  };
+
+  // Fire ALL emails at once — FastAPI handles them concurrently
+  await Promise.all(toEnrich.map((email, idx) => enrichOne(email, idx)));
+
+  console.log('[NLP] Enrichment complete: %d emails in %dms', toEnrich.length, Date.now() - startTime);
+
+  // Mark remaining emails as not enriched
+  for (let i = maxEnrich; i < emails.length; i++) {
+    emails[i].extracted = { supplier: null, partNumbers: [] };
+    emails[i].classification = { step: 0, confidence: 0 };
+  }
+
+  return emails;
+}
 
 function isGrey(name) {
   const lower = (name || '').toLowerCase();
@@ -154,7 +308,7 @@ function checkMboxFile(fileName, parentDir) {
   const fp = path.join(parentDir, fileName);
   let stats;
   try { stats = fs.statSync(fp); } catch (e) { return null; }
-  if (stats.size < 1) return null; // Even empty files are valid MBOX
+  if (stats.size < 0) return null; // Accept empty files (0 bytes) as valid MBOX
 
   const hasMsf = fs.existsSync(fp + '.msf');
 
@@ -285,8 +439,8 @@ function scanFolderTree(dir, depth) {
       }
     }
 
-    // ALWAYS add the node if it has children, mboxes, .sbd, or is a potential folder
-    if (node.children.length > 0 || node.mboxes.length > 0 || g.sbd || g._maybeFolder) {
+    // ALWAYS add the node if it has children, mboxes, .sbd, subdirs, or is a potential folder
+    if (node.children.length > 0 || node.mboxes.length > 0 || g.sbd || g.subdirs || g._maybeFolder) {
       result.children.push(node);
       result.totalEmails += node.totalEmails;
       // Also add to mboxes list at this level for aggregation
@@ -344,6 +498,13 @@ function findThunderbirdProfiles() {
           }
           if (!displayName) displayName = ent.name.replace(/^imap\./, '').replace(/^pop\./, '');
 
+          // Skip known junk accounts
+          const displayNameLower = (displayName || '').toLowerCase();
+          if (SKIP_ACCOUNTS.has(displayNameLower) || SKIP_ACCOUNTS.has(displayName)) {
+            console.log('[TB] Skipping junk account:', displayName);
+            continue;
+          }
+
           trees.push({
             name: displayName,
             type: 'account',
@@ -356,13 +517,107 @@ function findThunderbirdProfiles() {
       } catch (e) {}
     }
 
-    if (trees.length > 0) {
-      const totalEmails = trees.reduce((s, t) => s + t.totalEmails, 0);
-      profiles.push({ name: entry.name, path: profilePath, trees, totalEmails });
+    // Merge trees with same email (Mail/ + ImapMail/ dedup)
+    const mergedTrees = mergeAccountTrees(trees);
+
+    if (mergedTrees.length > 0) {
+      const totalEmails = mergedTrees.reduce((s, t) => s + t.totalEmails, 0);
+      console.log('[TB] Profile %s: %d accounts after merge: %s', entry.name, mergedTrees.length, mergedTrees.map(t => t.name + '(' + t.totalEmails + ')').join(', '));
+      profiles.push({ name: entry.name, path: profilePath, trees: mergedTrees, totalEmails });
     }
   }
 
   return { path: tbPath, profiles };
+}
+
+function mergeAccountTrees(trees) {
+  const byEmail = new Map();
+
+  // Step 1: Collect ALL Local Folders entries and merge their children
+  const allLocalChildren = [];
+  const allLocalMboxes = [];
+  let localFoldersCount = 0;
+  for (const tree of trees) {
+    if (tree.name === 'Local Folders') {
+      localFoldersCount++;
+      console.log('[TB-MERGE] Found Local Folders #%d: %d children, %d mboxes, %d totalEmails', localFoldersCount, tree.children.length, tree.mboxes.length, tree.totalEmails);
+      for (const c of tree.children) {
+        console.log('[TB-MERGE]  Local child: "%s" (%d emails)', c.name, c.totalEmails || 0);
+      }
+      allLocalChildren.push(...tree.children);
+      allLocalMboxes.push(...tree.mboxes);
+    }
+  }
+  console.log('[TB-MERGE] Total Local Folders found: %d, total children to process: %d', localFoldersCount, allLocalChildren.length);
+
+  // Step 2: Add non-Local-Folders to byEmail (merge duplicates)
+  for (const tree of trees) {
+    if (tree.name === 'Local Folders') continue;
+    console.log('[TB-MERGE] Account in byEmail: "%s" (%d emails)', tree.name, tree.totalEmails);
+    if (!byEmail.has(tree.name)) {
+      byEmail.set(tree.name, { ...tree, children: [...tree.children], mboxes: [...tree.mboxes] });
+    } else {
+      const existing = byEmail.get(tree.name);
+      console.log('[TB-MERGE]  Merging duplicate "%s": %d + %d emails', tree.name, existing.totalEmails, tree.totalEmails);
+      existing.children.push(...tree.children);
+      existing.mboxes.push(...tree.mboxes);
+      existing.mboxCount += tree.mboxCount;
+      existing.totalEmails += tree.totalEmails;
+    }
+  }
+
+  // Step 3: Move Local Folders children to their accounts
+  // Child name pattern: "Sent-izhustrov@import-detal36.ru" or "Отправленные-commercial@field-pro.ae"
+  const remainingLocalChildren = [];
+  for (const child of allLocalChildren) {
+    let moved = false;
+    for (const [email, account] of byEmail) {
+      if (email === 'Local Folders') continue;
+      // Check if child name ends with email (after dash or underscore)
+      if (child.name === email || child.name.endsWith('-' + email) || child.name.endsWith('_' + email)) {
+        const prefix = child.name.substring(0, child.name.length - email.length).replace(/[-_]$/, '');
+        const oldName = child.name;
+        child.name = prefix || child.name;
+        console.log('[TB-MERGE]  MOVED "%s" → "%s" under "%s"', oldName, child.name, email);
+        account.children.push(child);
+        account.totalEmails += child.totalEmails || 0;
+        moved = true;
+        break;
+      }
+    }
+    if (!moved) remainingLocalChildren.push(child);
+  }
+
+  // Step 4: Add remaining Local Folders (unmatched items)
+  if (remainingLocalChildren.length > 0 || allLocalMboxes.length > 0) {
+    byEmail.set('Local Folders', {
+      name: 'Local Folders',
+      type: 'account',
+      children: remainingLocalChildren,
+      mboxes: allLocalMboxes,
+      mboxCount: allLocalMboxes.reduce((s, m) => s + (m.emailCount || 0), 0),
+      totalEmails: remainingLocalChildren.reduce((s, c) => s + (c.totalEmails || 0), 0) + allLocalMboxes.reduce((s, m) => s + (m.emailCount || 0), 0),
+    });
+    console.log('[TB-MERGE] Remaining Local Folders: %d children', remainingLocalChildren.length);
+    for (const c of remainingLocalChildren) {
+      console.log('[TB-MERGE]  Remaining: "%s"', c.name);
+    }
+  }
+
+  // Step 5: Flatten [Gmail] into parent account
+  for (const [, tree] of byEmail) {
+    const gmailIdx = tree.children.findIndex(c => c.name === '[Gmail]');
+    if (gmailIdx >= 0) {
+      const gmailNode = tree.children[gmailIdx];
+      console.log('[TB-MERGE] Flattening [Gmail] (%d children) into "%s"', gmailNode.children.length, tree.name);
+      tree.children.splice(gmailIdx, 1, ...gmailNode.children);
+      tree.totalEmails += gmailNode.totalEmails;
+    }
+  }
+
+  const result = Array.from(byEmail.values());
+  console.log('[TB-MERGE] Final accounts: %s', result.map(t => t.name + '(' + t.totalEmails + ')').join(', '));
+  return result;
 }
 
 function parseMboxEmails(content, maxEmails) {
@@ -412,6 +667,9 @@ function finalizeEmail(e) {
   e.threadConfidence = 1.0;
   e.hasConflict = false;
   e.id = e.messageId ? parseInt(e.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000) : Math.floor(Math.random() * 1000000);
+  // Initialize NLP fields
+  e.extracted = { supplier: null, partNumbers: [] };
+  e.classification = { step: 0, confidence: 0 };
   return e;
 }
 
@@ -427,9 +685,22 @@ ipcMain.handle('thunderbird:discover', () => {
 ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100) => {
   try {
     const stats = fs.statSync(mboxPath);
-    if (stats.size > 200 * 1024 * 1024) return { success: false, error: 'File too large (>200MB)' };
+    if (stats.size > 500 * 1024 * 1024) return { success: false, error: 'File too large (>500MB)' };
     const content = fs.readFileSync(mboxPath, 'utf8');
     const emails = parseMboxEmails(content, maxEmails);
+
+    // ── NLP Enrichment: enrich top 2 emails with AI (parallel) ──
+    if (pythonAvailable && emails.length > 0) {
+      try {
+        await enrichEmailsWithNLP(emails, 2);
+      } catch (nlpErr) {
+        console.error('[NLP] Enrichment error:', nlpErr.message);
+        // Continue without enrichment — emails already have default NLP fields
+      }
+    } else {
+      console.log('[NLP] Skipping enrichment: pythonAvailable=' + pythonAvailable + ', emailCount=' + emails.length);
+    }
+
     return { success: true, emails, total: emails.length };
   } catch (err) {
     return { success: false, error: err.message };
@@ -465,7 +736,14 @@ function createWindow() {
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Check Python NLP service on startup
+  await checkPython();
+  if (!pythonAvailable) {
+    console.log('[PY] Python NLP service not available. NLP enrichment disabled.');
+    console.log('[PY] Start it with: uvicorn main:app --port 8721 (from python_service folder)');
+  }
+
   createWindow();
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });

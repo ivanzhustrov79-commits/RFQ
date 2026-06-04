@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
 import { useState } from 'react';
-import { X, Mail, RefreshCw, AlertCircle, FolderOpen, ChevronDown, ChevronRight, Inbox, Check } from 'lucide-react';
+import { X, Mail, RefreshCw, AlertCircle, FolderOpen, ChevronDown, ChevronRight, Inbox, Check, Eye, EyeOff } from 'lucide-react';
 
 interface MboxFile {
   name: string;
@@ -40,12 +40,15 @@ export function ThunderbirdPanel() {
   const [expandedAccounts, setExpandedAccounts] = useState<Set<string>>(new Set());
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [loadingMbox, setLoadingMbox] = useState<string | null>(null);
+  const [showHidden, setShowHidden] = useState(false);
 
   const handleClose = () => { dispatch({ type: 'TOGGLE_THUNDERBIRD_PANEL' }); };
+  const handleHideAccount = (accountName: string) => { dispatch({ type: 'TOGGLE_HIDDEN_ACCOUNT', payload: accountName }); };
 
   const handleDiscover = async () => {
     setScanning(true);
     setError(null);
+    setLoadingMbox(null);
     try {
       const result = await window.electronAPI.thunderbird.discover();
       if (result && result.profiles) {
@@ -83,7 +86,7 @@ export function ThunderbirdPanel() {
     setLoadingMbox(mboxPath);
     setError(null);
     try {
-      const result = await window.electronAPI.thunderbird.readMbox(mboxPath, 100);
+      const result = await window.electronAPI.thunderbird.readMbox(mboxPath, 10000);
       if (result.success && result.emails) {
         dispatch({ type: 'SET_REAL_EMAILS', payload: result.emails });
         dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
@@ -158,22 +161,33 @@ export function ThunderbirdPanel() {
               <div className="px-3 py-1 text-micro font-semibold uppercase tracking-wide" style={{ color: 'var(--text-tertiary)' }}>
                 {profile.name}
               </div>
-              {Array.isArray(profile.trees) && profile.trees.map((tree: AccountTree, aIdx: number) => {
-                const key = `a-${pIdx}-${aIdx}`;
-                const isExpanded = expandedAccounts.has(key);
-                const accountName = tree.name || 'Unknown';
-                return (
-                  <div key={key}>
-                    <button onClick={() => toggleAccount(key)} className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-white/5">
-                      {isExpanded
-                        ? <ChevronDown className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
-                        : <ChevronRight className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />}
-                      <FolderOpen className="w-4 h-4 shrink-0" style={{ color: 'var(--plum-accent)' }} />
-                      <span className="text-small flex-1 truncate" style={{ color: 'var(--text-primary)' }}>{accountName}</span>
-                      <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>
-                        {tree.totalEmails > 999 ? (tree.totalEmails/1000).toFixed(1) + 'k' : tree.totalEmails}
-                      </span>
-                    </button>
+              {Array.isArray(profile.trees) && profile.trees
+                .filter((tree: AccountTree) => showHidden || !state.hiddenAccounts.has(tree.name || ''))
+                .map((tree: AccountTree, aIdx: number) => {
+                  const key = `a-${pIdx}-${aIdx}`;
+                  const isExpanded = expandedAccounts.has(key);
+                  const accountName = tree.name || 'Unknown';
+                  const isHidden = state.hiddenAccounts.has(accountName);
+                  return (
+                    <div key={key}>
+                      <button onClick={() => toggleAccount(key)} className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-white/5 group">
+                        {isExpanded
+                          ? <ChevronDown className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+                          : <ChevronRight className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />}
+                        <FolderOpen className="w-4 h-4 shrink-0" style={{ color: isHidden ? 'var(--text-tertiary)' : 'var(--plum-accent)' }} />
+                        <span className="text-small flex-1 truncate" style={{ color: isHidden ? 'var(--text-tertiary)' : 'var(--text-primary)' }}>{accountName}</span>
+                        <span className="text-micro" style={{ color: isHidden ? 'var(--text-tertiary)' : 'var(--text-tertiary)' }}>
+                          {tree.totalEmails > 999 ? (tree.totalEmails/1000).toFixed(1) + 'k' : tree.totalEmails}
+                        </span>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleHideAccount(accountName); }}
+                          className="p-1 rounded-md opacity-0 group-hover:opacity-100 hover:bg-white/10"
+                          title={isHidden ? 'Unhide account' : 'Hide account'}
+                          style={{ color: 'var(--text-tertiary)' }}
+                        >
+                          {isHidden ? <Eye className="w-3 h-3" /> : <X className="w-3 h-3" />}
+                        </button>
+                      </button>
                     {isExpanded && Array.isArray(tree.children) && tree.children.map((folder: FolderNode, fIdx: number) => (
                       <FolderNodeComp
                         key={`${key}-f${fIdx}`}
@@ -193,6 +207,21 @@ export function ThunderbirdPanel() {
               })}
             </div>
           ))}
+
+          {state.thunderbirdData && state.hiddenAccounts.size > 0 && (
+            <button
+              onClick={() => setShowHidden(!showHidden)}
+              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-white/5 border-t"
+              style={{ borderColor: 'var(--border-color)' }}
+            >
+              {showHidden
+                ? <EyeOff className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+                : <Eye className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />}
+              <span className="text-small" style={{ color: 'var(--text-tertiary)' }}>
+                {showHidden ? 'Hide hidden accounts' : `Show ${state.hiddenAccounts.size} hidden account(s)`}
+              </span>
+            </button>
+          )}
         </div>
       </div>
     </>

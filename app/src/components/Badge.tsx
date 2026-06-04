@@ -4,6 +4,7 @@ interface BadgeProps {
   children: React.ReactNode;
   variant?: 'open' | 'pending' | 'approved' | 'closed' | 'base' | 'smart' | 'boost' | 'internal' | 'sent' | 'high' | 'medium' | 'low' | 'default';
   className?: string;
+  title?: string;
 }
 
 const variantStyles: Record<string, string> = {
@@ -22,7 +23,7 @@ const variantStyles: Record<string, string> = {
   default: 'bg-[var(--border-light)] text-[var(--text-secondary)]',
 };
 
-export function Badge({ children, variant = 'default', className }: BadgeProps) {
+export function Badge({ children, variant = 'default', className, title }: BadgeProps) {
   return (
     <span
       className={cn(
@@ -30,6 +31,7 @@ export function Badge({ children, variant = 'default', className }: BadgeProps) 
         variantStyles[variant] || variantStyles.default,
         className
       )}
+      title={title}
     >
       {children}
     </span>

@@ -18,6 +18,16 @@ export interface Email {
   smartConfirmedStep: number | null;
   isLowConfidence: boolean;
   isProvisional: boolean;
+  // NLP enrichment fields
+  body?: string;
+  extracted?: {
+    supplier: string | null;
+    partNumbers: string[];
+  };
+  classification?: {
+    step: number;
+    confidence: number;
+  };
 }
 
 // Legacy interfaces for old components
@@ -50,6 +60,7 @@ interface AppState {
   aiMode: 'off' | 'auto' | 'full';
   componentStatuses: any[];
   troubleshootTarget: { level: number; targetId: string } | null;
+  hiddenAccounts: Set<string>;
 }
 
 type Action =
@@ -70,7 +81,8 @@ type Action =
   | { type: 'RESOLVE_EXCEPTION'; payload: string }
   | { type: 'ADD_CHAT_MESSAGE'; payload: ChatMessage }
   | { type: 'SET_AI_MODE'; payload: 'off' | 'auto' | 'full' }
-  | { type: 'OPEN_TROUBLESHOOT'; payload: { level: number; targetId: string } };
+  | { type: 'OPEN_TROUBLESHOOT'; payload: { level: number; targetId: string } }
+  | { type: 'TOGGLE_HIDDEN_ACCOUNT'; payload: string };
 
 const initialState: AppState = {
   theme: 'dark', fontSize: 'medium', useRealData: false,
@@ -80,7 +92,7 @@ const initialState: AppState = {
   isSettingsOpen: false, syncedFolders: new Set(),
   suppliers: [], selectedSupplierId: null, rfqs: [],
   selectedRfqId: null, alarms: [], exceptions: [],
-  troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null,
+  troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null, hiddenAccounts: new Set(),
 };
 
 function appReducer(state: AppState, action: Action): AppState {
@@ -103,6 +115,7 @@ function appReducer(state: AppState, action: Action): AppState {
     case 'ADD_CHAT_MESSAGE': return { ...state, troubleshootChat: [...state.troubleshootChat, action.payload] };
     case 'SET_AI_MODE': return { ...state, aiMode: action.payload };
     case 'OPEN_TROUBLESHOOT': return { ...state, isTroubleshootOpen: true, troubleshootTarget: action.payload };
+    case 'TOGGLE_HIDDEN_ACCOUNT': { const h = new Set(state.hiddenAccounts); if (h.has(action.payload)) h.delete(action.payload); else h.add(action.payload); return { ...state, hiddenAccounts: h }; }
     default: return state;
   }
 }
@@ -122,18 +135,18 @@ const AppContext = createContext<AppContextType | null>(null);
 function getSavedSettings(): Partial<AppState> {
   try {
     const s = localStorage.getItem('rfq-settings');
-    if (s) { const p = JSON.parse(s); return { theme: p.theme || 'dark', fontSize: p.fontSize || 'medium', syncedFolders: new Set(p.syncedFolders || []) }; }
+    if (s) { const p = JSON.parse(s); return { theme: p.theme || 'dark', fontSize: p.fontSize || 'medium', syncedFolders: new Set(p.syncedFolders || []), hiddenAccounts: new Set(p.hiddenAccounts || []) }; }
   } catch (e) {}
   return {};
 }
 
 function saveSettings(state: AppState) {
-  try { localStorage.setItem('rfq-settings', JSON.stringify({ theme: state.theme, fontSize: state.fontSize, syncedFolders: Array.from(state.syncedFolders) })); } catch (e) {}
+  try { localStorage.setItem('rfq-settings', JSON.stringify({ theme: state.theme, fontSize: state.fontSize, syncedFolders: Array.from(state.syncedFolders), hiddenAccounts: Array.from(state.hiddenAccounts) })); } catch (e) {}
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState, (init) => ({ ...init, ...getSavedSettings() }));
-  useEffect(() => { saveSettings(state); }, [state.theme, state.fontSize, state.syncedFolders]);
+  useEffect(() => { saveSettings(state); }, [state.theme, state.fontSize, state.syncedFolders, state.hiddenAccounts]);
 
   const getFilteredEmails = () => state.emails;
   const getSupplierKpis = (_id: string) => ({});
