@@ -1,8 +1,28 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
 import type { Email, PartNumber } from '@/types';
-import { format, parseISO, differenceInDays } from 'date-fns';
+import { differenceInDays, format, parseISO, isValid } from 'date-fns';
 import { Clock, Hash, Mail, AlertCircle, FileText, DollarSign, Package, BarChart3 } from 'lucide-react';
+
+function safeFormat(dateValue: string | Date | null | undefined, fmt: string = 'MMM d, HH:mm', fallback: string = '—'): string {
+  if (!dateValue) return fallback;
+  try {
+    let date: Date;
+    if (dateValue instanceof Date) { date = dateValue; }
+    else if (typeof dateValue === 'string' && (dateValue.includes('T') || dateValue.match(/^\d{4}-\d{2}-\d{2}/))) { date = new Date(dateValue); }
+    else { date = new Date(dateValue); }
+    return isValid(date) ? format(date, fmt) : fallback;
+  } catch { return fallback; }
+}
+function safeParse(dateValue: string | null | undefined): Date | null {
+  if (!dateValue) return null;
+  try {
+    let date: Date;
+    if (dateValue.includes('T') || dateValue.match(/^\d{4}-\d{2}-\d{2}/)) { date = parseISO(dateValue); }
+    else { date = new Date(dateValue); }
+    return isValid(date) ? date : null;
+  } catch { return null; }
+}
 import { useState } from 'react';
 
 type Tab = 'timeline' | 'parts' | 'summary';
@@ -85,7 +105,7 @@ function TimelineTab({ emails }: { emails: Email[] }) {
         >
           <div className="flex items-center justify-between">
             <span className="text-micro" style={{ color: 'var(--text-secondary)' }}>
-              {format(parseISO(email.sentAt), 'MMM d, HH:mm')}
+              {safeFormat(email.sentAt, 'MMM d, HH:mm')}
             </span>
             <div className="flex items-center gap-1">
               {email.isInternal && (
@@ -164,7 +184,8 @@ function SummaryTab({
   emailCount: number;
   alarmCount: number;
 }) {
-  const daysOpen = differenceInDays(new Date(), parseISO(rfq.createdAt));
+  const createdDate = safeParse(rfq.createdAt);
+  const daysOpen = createdDate ? differenceInDays(new Date(), createdDate) : 0;
 
   return (
     <div className="space-y-3">

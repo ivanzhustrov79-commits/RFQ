@@ -67,6 +67,67 @@ function callPython(endpoint, payload, method = 'POST') {
   });
 }
 
+// ── Background NLP Queue (fire-and-forget) ──
+async function queueEmailsForBackgroundNLP(emails) {
+  if (!pythonAvailable) return;
+  const messageIds = emails.map(e => e.messageId).filter(Boolean);
+  if (messageIds.length === 0) return;
+
+  // Track these for polling
+  for (const id of messageIds) {
+    _pendingNlpMessageIds.add(id);
+  }
+
+  try {
+    const result = await callPython('/nlp/queue', { message_ids: messageIds });
+    console.log('[NLP-QUEUE] Queued %d emails. Pending: %d. Stats: %j',
+      result.queued || 0, _pendingNlpMessageIds.size, result.stats || {});
+    // Start polling if not already running
+    startNlpPolling();
+  } catch (err) {
+    console.log('[NLP-QUEUE] Error:', err.message);
+  }
+}
+
+let _nlpPollInterval = null;
+const _pendingNlpMessageIds = new Set();
+
+function startNlpPolling() {
+  if (_nlpPollInterval) return;
+  console.log('[NLP-POLL] Starting result polling (30s)');
+  _nlpPollInterval = setInterval(pollNlpResults, 30000);
+}
+
+function stopNlpPolling() {
+  if (_nlpPollInterval) {
+    clearInterval(_nlpPollInterval);
+    _nlpPollInterval = null;
+    console.log('[NLP-POLL] Stopped');
+  }
+}
+
+async function pollNlpResults() {
+  if (!pythonAvailable || _pendingNlpMessageIds.size === 0) {
+    if (_pendingNlpMessageIds.size === 0) stopNlpPolling();
+    return;
+  }
+  const ids = Array.from(_pendingNlpMessageIds);
+  try {
+    const result = await callPython('/nlp/results', { message_ids: ids });
+    const results = result.results || {};
+    const completedIds = Object.keys(results);
+    if (completedIds.length > 0) {
+      console.log('[NLP-POLL] %d new results', completedIds.length);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('nlp:results', results);
+      }
+      for (const id of completedIds) _pendingNlpMessageIds.delete(id);
+    }
+  } catch (err) {
+    // Retry next poll
+  }
+}
+
 // Check if Python service is running (GET request for /health)
 async function checkPython() {
   try {
@@ -97,11 +158,12 @@ async function enrichEmailsWithNLP(emails, maxEnrich = 2) {
   }
 
   const toEnrich = emails.slice(0, maxEnrich);
-  console.log('[NLP] Enriching top %d of %d emails in PARALLEL...', toEnrich.length, emails.length);
+  console.log('[NLP] Enriching top %d of %d emails (SMART mode, sequential)...', toEnrich.length, emails.length);
   const startTime = Date.now();
 
-  // Build all API calls for all emails, then fire them ALL at once
-  const enrichOne = async (email, idx) => {
+  // Process sequentially — CPU can only handle one LLM at a time
+  for (let i = 0; i < toEnrich.length; i++) {
+    const email = toEnrich[i];
     const senderDomain = extractDomain(email.senderEmail || email.from || '');
     const t0 = Date.now();
     try {
@@ -139,17 +201,14 @@ async function enrichEmailsWithNLP(emails, maxEnrich = 2) {
       }
 
       console.log('[NLP] Email %d (%dms): supplier="%s", parts=%j, step=%d, conf=%s',
-        idx + 1, dt, email.extracted.supplier || '-', email.extracted.partNumbers,
+        i + 1, dt, email.extracted.supplier || '-', email.extracted.partNumbers,
         email.classification.step, email.classification.confidence.toFixed(2));
     } catch (err) {
-      console.log('[NLP] Email %d failed: %s', idx + 1, err.message);
+      console.log('[NLP] Email %d failed: %s', i + 1, err.message);
       email.extracted = { supplier: null, partNumbers: [] };
       email.classification = { step: 0, confidence: 0 };
     }
-  };
-
-  // Fire ALL emails at once — FastAPI handles them concurrently
-  await Promise.all(toEnrich.map((email, idx) => enrichOne(email, idx)));
+  }
 
   console.log('[NLP] Enrichment complete: %d emails in %dms', toEnrich.length, Date.now() - startTime);
 
@@ -670,6 +729,7 @@ function finalizeEmail(e) {
   // Initialize NLP fields
   e.extracted = { supplier: null, partNumbers: [] };
   e.classification = { step: 0, confidence: 0 };
+  e.supplierName = ''; // Will be set by cross-mailbox supplier matching
   return e;
 }
 
@@ -682,23 +742,75 @@ ipcMain.handle('thunderbird:discover', () => {
   }
 });
 
-ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100) => {
+// Helper: extract folder name from mbox path (e.g., ".../Mail/account/Supplier Name")
+function extractFolderNameFromPath(mboxPath) {
+  try {
+    // Get the parent directory name (which is the folder name in Thunderbird)
+    const parentDir = path.basename(path.dirname(mboxPath));
+    // Also try the file name itself (for top-level folders)
+    const fileName = path.basename(mboxPath, '.sbd');
+    // Use parent dir if it's meaningful, otherwise file name
+    if (parentDir && parentDir !== 'Mail' && parentDir !== 'ImapMail') {
+      return parentDir;
+    }
+    return fileName;
+  } catch {
+    return '';
+  }
+}
+
+ipcMain.handle('suppliers:list', async () => {
+  if (!pythonAvailable) return { suppliers: [], count: 0 };
+  try {
+    const result = await callPython('/db/suppliers', null, 'GET');
+    return { suppliers: result.suppliers || [], count: result.count || 0 };
+  } catch (err) {
+    console.log('[SUPPLIERS-IPC] Failed:', err.message);
+    return { suppliers: [], count: 0, error: err.message };
+  }
+});
+
+ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100, folderName = '') => {
   try {
     const stats = fs.statSync(mboxPath);
     if (stats.size > 500 * 1024 * 1024) return { success: false, error: 'File too large (>500MB)' };
     const content = fs.readFileSync(mboxPath, 'utf8');
     const emails = parseMboxEmails(content, maxEmails);
 
-    // ── NLP Enrichment: enrich top 2 emails with AI (parallel) ──
-    if (pythonAvailable && emails.length > 0) {
+    // ── Cross-mailbox supplier matching ──
+    // Tag all emails with supplier based on folder name
+    const effectiveFolderName = folderName || extractFolderNameFromPath(mboxPath);
+    if (pythonAvailable && emails.length > 0 && effectiveFolderName) {
       try {
-        await enrichEmailsWithNLP(emails, 2);
-      } catch (nlpErr) {
-        console.error('[NLP] Enrichment error:', nlpErr.message);
-        // Continue without enrichment — emails already have default NLP fields
+        // Get supplier from first email's sender domain
+        const firstEmail = emails[0];
+        const senderEmail = firstEmail.senderEmail || firstEmail.from || '';
+        const senderDomain = extractDomain(senderEmail);
+
+        const supplierResult = await callPython('/db/supplier-by-folder', {
+          folder_name: effectiveFolderName,
+          email_domain: senderDomain,
+          sender_email: senderEmail,
+        });
+
+        // Tag all emails with supplier_id
+        for (const email of emails) {
+          email.supplierId = supplierResult.supplier_id;
+          email.supplierName = supplierResult.name;
+        }
+        console.log('[TB-SUPPLIER] Folder "%s" → supplier_id=%d (%s), emails=%d',
+          effectiveFolderName, supplierResult.supplier_id, supplierResult.name, emails.length);
+      } catch (supplierErr) {
+        console.log('[TB-SUPPLIER] Failed to match supplier: %s', supplierErr.message);
+        // Continue without supplier tagging
       }
-    } else {
-      console.log('[NLP] Skipping enrichment: pythonAvailable=' + pythonAvailable + ', emailCount=' + emails.length);
+    }
+
+    // ── Queue emails for background NLP enrichment ──
+    if (pythonAvailable && emails.length > 0) {
+      queueEmailsForBackgroundNLP(emails).catch(err => {
+        console.log('[NLP-QUEUE] Failed:', err.message);
+      });
     }
 
     return { success: true, emails, total: emails.length };
@@ -736,6 +848,108 @@ function createWindow() {
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
+// ── Auto-Sync State ──
+let _syncedFolderPaths = {};    // syncKey -> mboxPath (received from renderer)
+let _autoSyncInterval = null;   // 5-minute timer
+let _isScanning = false;        // prevent overlapping scans
+
+// Receive synced folder paths from renderer (for health checks)
+ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
+  _syncedFolderPaths = paths || {};
+  console.log('[TB-SYNC] Received %d synced folder paths', Object.keys(_syncedFolderPaths).length);
+});
+
+// Perform full Thunderbird sync + health check
+async function runThunderbirdSync() {
+  if (_isScanning) {
+    console.log('[TB-SYNC] Scan already in progress, skipping');
+    return;
+  }
+  _isScanning = true;
+  const t0 = Date.now();
+
+  try {
+    console.log('[TB-SYNC] Starting auto-sync...');
+    const result = findThunderbirdProfiles();
+
+    if (result.error) {
+      console.log('[TB-SYNC] Scan failed:', result.error);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('thunderbird:syncError', result.error);
+      }
+      return;
+    }
+
+    // Health check: verify synced folders still exist
+    const missingFolders = [];
+    for (const [syncKey, mboxPath] of Object.entries(_syncedFolderPaths)) {
+      if (!fs.existsSync(mboxPath)) {
+        console.log('[TB-HEALTH] Synced folder missing: %s -> %s', syncKey, mboxPath);
+        missingFolders.push(syncKey);
+      }
+    }
+
+    // Send results to renderer
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('thunderbird:autoSync', {
+        profiles: result.profiles,
+        missingFolders,
+        scanTimeMs: Date.now() - t0,
+      });
+    }
+
+    console.log('[TB-SYNC] Auto-sync complete: %d profiles, %d missing folders, %dms',
+      result.profiles.length, missingFolders.length, Date.now() - t0);
+
+    // Auto-reload synced folders that are still healthy
+    for (const [syncKey, mboxPath] of Object.entries(_syncedFolderPaths)) {
+      if (missingFolders.includes(syncKey)) continue;
+      try {
+        const stats = fs.statSync(mboxPath);
+        if (stats.size > 500 * 1024 * 1024) continue;
+        const content = fs.readFileSync(mboxPath, 'utf8');
+        const emails = parseMboxEmails(content, 10000);
+        if (emails.length > 0) {
+          // Queue for NLP
+          if (pythonAvailable) {
+            queueEmailsForBackgroundNLP(emails).catch(() => {});
+          }
+          // Send to renderer for live update
+          mainWindow.webContents.send('thunderbird:folderUpdate', {
+            syncKey,
+            emails,
+            total: emails.length,
+          });
+        }
+      } catch (err) {
+        console.log('[TB-SYNC] Reload failed for %s: %s', syncKey, err.message);
+      }
+    }
+
+  } catch (err) {
+    console.error('[TB-SYNC] Auto-sync error:', err);
+  } finally {
+    _isScanning = false;
+  }
+}
+
+function startAutoSync() {
+  if (_autoSyncInterval) return;
+  console.log('[TB-SYNC] Starting auto-sync (every 5 minutes)');
+  // First scan after 3 seconds (let renderer settle)
+  setTimeout(runThunderbirdSync, 3000);
+  // Then every 5 minutes
+  _autoSyncInterval = setInterval(runThunderbirdSync, 5 * 60 * 1000);
+}
+
+function stopAutoSync() {
+  if (_autoSyncInterval) {
+    clearInterval(_autoSyncInterval);
+    _autoSyncInterval = null;
+    console.log('[TB-SYNC] Auto-sync stopped');
+  }
+}
+
 app.whenReady().then(async () => {
   // Check Python NLP service on startup
   await checkPython();
@@ -745,7 +959,17 @@ app.whenReady().then(async () => {
   }
 
   createWindow();
+
+  // Start background Thunderbird auto-sync after window loads
+  mainWindow.once('ready-to-show', () => {
+    startAutoSync();
+  });
+
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  stopAutoSync();
+  stopNlpPolling();
+  if (process.platform !== 'darwin') app.quit();
+});

@@ -1,14 +1,23 @@
-// @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import type { Email } from '@/types';
+import type { Email } from '@/context/AppContext';
 import { EmailCard } from './EmailCard';
-import { workflowSteps } from '@/lib/mockData';
 import { useState, useCallback } from 'react';
+
+// Define workflow steps inline to avoid import issues
+const workflowSteps = [
+  { id: 1, stepName: 'Purchase Request' },
+  { id: 2, stepName: 'RFQ Sent' },
+  { id: 3, stepName: 'RFQ Received' },
+  { id: 4, stepName: 'Negotiation' },
+  { id: 5, stepName: 'CI / Invoice' },
+  { id: 6, stepName: 'CI Approved' },
+  { id: 7, stepName: 'Timeline' },
+];
 
 export function KanbanBoard() {
   const { state, dispatch, getFilteredEmails } = useApp();
-  const filteredEmails = getFilteredEmails();
-  const [contextMenu, setContextMenu] = useState<{
+  const filteredEmails = getFilteredEmails() || [];
+  const [contextMenu, setContextMenu] = useState<<{
     x: number;
     y: number;
     email: Email | null;
@@ -63,7 +72,7 @@ export function KanbanBoard() {
             style={{ backgroundColor: 'var(--column-bg)' }}
           >
             <div
-              className={`flex items-center justify-between px-3 py-2 column-header-gradient-${step.id}`}
+              className="flex items-center justify-between px-3 py-2"
               style={{
                 backgroundColor: 'var(--card-bg)',
                 borderBottom: '1px solid var(--border-color)',

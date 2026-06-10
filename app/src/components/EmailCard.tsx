@@ -1,24 +1,7 @@
 import type { Email } from '@/context/AppContext';
 import { Badge } from './Badge';
-import { format, parseISO, isValid } from 'date-fns';
+import { safeFormat } from '@/lib/dateSafe';
 import { Cpu, Hash } from 'lucide-react';
-
-// Safe date formatter that handles various date formats
-function DateLabel({ sentAt }: { sentAt: string | undefined }) {
-  if (!sentAt) return <span>—</span>;
-  try {
-    let date: Date;
-    if (sentAt.includes('T') || sentAt.match(/^\d{4}-\d{2}-\d{2}/)) {
-      date = parseISO(sentAt);
-    } else {
-      date = new Date(sentAt);
-    }
-    if (!isValid(date)) return <span>—</span>;
-    return <span>{format(date, 'MMM d HH:mm')}</span>;
-  } catch {
-    return <span>—</span>;
-  }
-}
 
 interface EmailCardProps {
   email: Email;
@@ -32,15 +15,12 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
     return '1px solid var(--border-color)';
   };
 
-  // Determine step badge color based on confidence
   const getStepBadgeVariant = () => {
     const conf = email.classification?.confidence || 0;
     if (conf >= 0.8) return 'approved' as const;
     if (conf >= 0.5) return 'pending' as const;
     return 'low' as const;
   };
-
-  const hasNlp = email.extracted?.supplier || (email.extracted?.partNumbers && email.extracted.partNumbers.length > 0) || (email.classification?.step && email.classification.step > 0);
 
   return (
     <div
@@ -64,7 +44,7 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
       <div className="drag-handle absolute left-1 top-1/2 -translate-y-1/2" />
 
       {email.isProvisional && (
-        <div className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full pulse-provisional" style={{ backgroundColor: 'var(--amber-alert)' }} />
+        <div className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full" style={{ backgroundColor: 'var(--amber-alert)' }} />
       )}
 
       {email.hasConflict && (
@@ -80,7 +60,7 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
       <div className="flex items-center justify-between gap-2 pl-3">
         <span className="text-small font-medium truncate" style={{ color: 'var(--text-primary)' }}>{email.senderName || 'Unknown'}</span>
         <span className="text-micro shrink-0" style={{ color: 'var(--text-secondary)' }}>
-          <DateLabel sentAt={email.sentAt} />
+          {safeFormat(email.sentAt, 'MMM d HH:mm')}
         </span>
       </div>
 
@@ -88,54 +68,53 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
         {email.subject}
       </p>
 
-      {/* ── NLP Badges ── */}
-      {hasNlp && (
-        <div className="flex flex-col gap-1 pl-3">
-          {/* Supplier + Step row */}
+      {/* Supplier + Step Badges */}
+      <div className="flex flex-col gap-1 pl-3">
+        {(email.supplierName || email.extracted?.supplier) && (
           <div className="flex items-center gap-1 flex-wrap">
-            {email.extracted?.supplier && (
-              <Badge variant="smart" className="max-w-[140px] truncate" title={email.extracted.supplier}>
-                <Cpu className="w-3 h-3 mr-1 shrink-0" />
-                {email.extracted.supplier}
+            <Badge variant="smart" className="max-w-[180px] truncate" title={email.supplierName || email.extracted?.supplier || ''}>
+              <Cpu className="w-3 h-3 mr-1 shrink-0" />
+              {email.supplierName || email.extracted?.supplier}
+            </Badge>
+            {(email.stepAssigned || email.classification?.step) ? (
+              <Badge variant={getStepBadgeVariant()} title={`Step ${email.stepAssigned || email.classification?.step}`}>
+                Step {email.stepAssigned || email.classification?.step}
               </Badge>
-            )}
-            {email.classification?.step && email.classification.step > 0 && (
-              <Badge variant={getStepBadgeVariant()} title={`Confidence: ${Math.round((email.classification.confidence || 0) * 100)}%`}>
-                Step {email.classification.step}
-              </Badge>
+            ) : null}
+          </div>
+        )}
+
+        {email.extracted?.partNumbers && email.extracted.partNumbers.length > 0 && (
+          <div className="flex items-center gap-1 flex-wrap">
+            {email.extracted.partNumbers.slice(0, 3).map((part, idx) => (
+              <span
+                key={idx}
+                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-micro font-medium"
+                style={{
+                  backgroundColor: 'rgba(107, 61, 139, 0.3)',
+                  color: 'var(--plum-accent)',
+                  border: '1px solid rgba(107, 61, 139, 0.5)',
+                }}
+                title="Extracted part number"
+              >
+                <Hash className="w-2.5 h-2.5" />
+                {part}
+              </span>
+            ))}
+            {email.extracted.partNumbers.length > 3 && (
+              <span className="text-micro px-1 py-0.5 rounded" style={{ color: 'var(--text-tertiary)' }}>
+                +{email.extracted.partNumbers.length - 3} more
+              </span>
             )}
           </div>
+        )}
 
-          {/* Part number pills */}
-          {email.extracted?.partNumbers && email.extracted.partNumbers.length > 0 && (
-            <div className="flex items-center gap-1 flex-wrap">
-              {email.extracted.partNumbers.slice(0, 3).map((part, idx) => (
-                <span
-                  key={idx}
-                  className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-micro font-medium"
-                  style={{
-                    backgroundColor: 'rgba(107, 61, 139, 0.3)',
-                    color: 'var(--plum-accent)',
-                    border: '1px solid rgba(107, 61, 139, 0.5)',
-                  }}
-                  title="Extracted part number"
-                >
-                  <Hash className="w-2.5 h-2.5" />
-                  {part}
-                </span>
-              ))}
-              {email.extracted.partNumbers.length > 3 && (
-                <span
-                  className="text-micro px-1 py-0.5 rounded"
-                  style={{ color: 'var(--text-tertiary)' }}
-                >
-                  +{email.extracted.partNumbers.length - 3} more
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-      )}
+        {email.classification?.confidence && email.classification.confidence > 0 && (
+          <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>
+            Confidence: {Math.round(email.classification.confidence * 100)}%
+          </span>
+        )}
+      </div>
 
       <div className="flex items-center gap-1 pl-3">
         {email.isInternal && <Badge variant="internal">Internal</Badge>}

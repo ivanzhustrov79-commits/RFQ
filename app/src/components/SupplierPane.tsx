@@ -1,6 +1,5 @@
-// @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import type { Supplier } from '@/types';
+import { Cpu, Mail } from 'lucide-react';
 
 function getSupplierColor(id: number): string {
   const colors = [
@@ -9,139 +8,77 @@ function getSupplierColor(id: number): string {
     'linear-gradient(to bottom, #27AE60, #2ECC71)',
     'linear-gradient(to bottom, #E67E22, #F5A623)',
     'linear-gradient(to bottom, #C0392B, #E74C3C)',
-    'linear-gradient(to bottom, #8E44AD, #9B59B6)',
   ];
   return colors[(id - 1) % colors.length];
 }
 
 export function SupplierPane() {
-  const { state, dispatch, getSupplierKpis } = useApp();
+  const { state, dispatch } = useApp();
 
   const handleSelect = (id: number) => {
     dispatch({ type: 'SELECT_SUPPLIER', payload: state.selectedSupplierId === id ? null : id });
   };
 
-  const selectedKpis = state.selectedSupplierId ? getSupplierKpis(state.selectedSupplierId) : null;
+  const suppliers = state.suppliers || [];
 
   return (
-    <div
-      className="w-[220px] shrink-0 flex flex-col overflow-hidden"
-      style={{ backgroundColor: 'var(--deep-plum-bg)' }}
-    >
+    <div className="w-[220px] shrink-0 flex flex-col overflow-hidden" style={{ backgroundColor: 'var(--deep-plum-bg)' }}>
       <div className="px-4 py-3 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-color)' }}>
         <h2 className="text-h1 font-semibold" style={{ color: 'var(--text-primary)' }}>Suppliers</h2>
-        <span
-          className="text-micro font-semibold px-1.5 py-0.5 rounded-full"
-          style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}
-        >
-          {state.suppliers.length}
+        <span className="text-micro font-semibold px-1.5 py-0.5 rounded-full" style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}>
+          {suppliers.length}
         </span>
       </div>
 
-      {selectedKpis && (
-        <div
-          className="px-3 py-3 grid grid-cols-5 gap-1 text-center"
-          style={{
-            backgroundColor: 'var(--kpi-strip-bg)',
-            borderBottom: '1px solid var(--border-color)',
-          }}
-        >
-          <KpiItem label="Open" value={selectedKpis.openRfqs} />
-          <KpiItem label="Avg Days" value={selectedKpis.avgResponseDays} />
-          <KpiItem label="Success %" value={selectedKpis.quoteSuccessRate} />
-          <KpiItem label="Alarms" value={selectedKpis.pendingAlarms} isAlarm />
-          <KpiItem label="Last" value={selectedKpis.lastActivity} isDate />
+      <div className="px-4 py-2 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-color)', backgroundColor: 'rgba(107,61,139,0.1)' }}>
+        <div className="flex flex-col">
+          <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>RFQs</span>
+          <span className="text-h2 font-bold" style={{ color: 'var(--text-primary)' }}>{suppliers.length}</span>
         </div>
-      )}
+        <div className="flex flex-col items-end">
+          <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>Emails</span>
+          <span className="text-h2 font-bold" style={{ color: 'var(--text-primary)' }}>{(state.emails || []).length}</span>
+        </div>
+      </div>
 
       <div className="flex-1 overflow-y-auto custom-scrollbar">
-        {state.suppliers.map((supplier) => (
-          <SupplierItem
-            key={supplier.id}
-            supplier={supplier}
-            isSelected={state.selectedSupplierId === supplier.id}
-            onClick={() => handleSelect(supplier.id)}
-          />
-        ))}
+        {suppliers.length === 0 ? (
+          <div className="px-4 py-8 text-center">
+            <Cpu className="w-8 h-8 mx-auto mb-2" style={{ color: 'var(--text-tertiary)', opacity: 0.5 }} />
+            <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>No suppliers yet</span>
+            <p className="text-micro mt-1" style={{ color: 'var(--text-tertiary)', opacity: 0.6 }}>Sync a folder to create suppliers</p>
+          </div>
+        ) : (
+          suppliers.map((supplier: any) => {
+            const isSelected = state.selectedSupplierId === supplier.id;
+            return (
+              <button
+                key={supplier.id}
+                onClick={() => handleSelect(supplier.id)}
+                className="w-full text-left px-3 py-2 hover:bg-white/5 transition-colors"
+                style={{
+                  borderLeft: isSelected ? '3px solid var(--plum-accent)' : '3px solid transparent',
+                  backgroundColor: isSelected ? 'rgba(107,61,139,0.2)' : 'transparent',
+                }}
+              >
+                <div className="flex items-center gap-2">
+                  <div className="w-3 h-3 rounded-full shrink-0" style={{ background: getSupplierColor(supplier.id) }} />
+                  <div className="flex-1 min-w-0">
+                    <span className="text-small font-medium truncate block" style={{ color: 'var(--text-primary)' }}>{supplier.name}</span>
+                    <div className="flex items-center gap-1 mt-0.5">
+                      <Mail className="w-3 h-3" style={{ color: 'var(--text-tertiary)' }} />
+                      <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>{supplier.total_emails || 0} emails</span>
+                      {supplier.enriched_emails > 0 && (
+                        <span className="text-micro" style={{ color: 'var(--green-success)' }}>({supplier.enriched_emails} AI)</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </button>
+            );
+          })
+        )}
       </div>
-    </div>
-  );
-}
-
-function SupplierItem({
-  supplier,
-  isSelected,
-  onClick,
-}: {
-  supplier: Supplier;
-  isSelected: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className="w-full flex items-center gap-2 px-3 py-2.5 text-left transition-colors duration-150 group"
-      style={{
-        backgroundColor: isSelected ? 'var(--brand-plum)' : 'transparent',
-        borderLeft: isSelected ? 'none' : '3px solid transparent',
-      }}
-      onMouseEnter={(e) => {
-        if (!isSelected) e.currentTarget.style.backgroundColor = 'rgba(128,128,128,0.08)';
-      }}
-      onMouseLeave={(e) => {
-        if (!isSelected) e.currentTarget.style.backgroundColor = 'transparent';
-      }}
-    >
-      <div
-        className="w-1 h-8 rounded-full shrink-0"
-        style={{ background: getSupplierColor(supplier.id) }}
-      />
-      <div className="flex-1 min-w-0">
-        <div
-          className="text-body font-medium truncate"
-          style={{ color: isSelected ? 'white' : 'var(--text-secondary)' }}
-        >
-          {supplier.name}
-        </div>
-      </div>
-      {supplier.openRfqCount > 0 && (
-        <span
-          className="text-micro font-semibold px-1.5 py-0.5 rounded-full shrink-0"
-          style={{
-            backgroundColor: isSelected ? 'rgba(255,255,255,0.2)' : 'var(--brand-plum)',
-            color: 'white',
-          }}
-        >
-          {supplier.openRfqCount}
-        </span>
-      )}
-    </button>
-  );
-}
-
-function KpiItem({
-  label,
-  value,
-  isAlarm,
-  isDate,
-}: {
-  label: string;
-  value: number | string;
-  isAlarm?: boolean;
-  isDate?: boolean;
-}) {
-  return (
-    <div className="flex flex-col items-center gap-0.5">
-      <span className="text-micro uppercase tracking-wider leading-tight" style={{ color: 'var(--text-tertiary)' }}>{label}</span>
-      <span
-        className="text-small font-bold leading-tight"
-        style={{
-          color: isAlarm && typeof value === 'number' && value > 0 ? 'var(--red-urgent)' : 'var(--text-primary)',
-          fontSize: isDate ? '9px' : undefined,
-        }}
-      >
-        {value}
-      </span>
     </div>
   );
 }

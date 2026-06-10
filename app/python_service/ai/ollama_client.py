@@ -8,8 +8,8 @@ from typing import Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "llama3.2:1b"
-TIMEOUT_SECONDS = 30
+DEFAULT_MODEL = "llama3.2"
+TIMEOUT_SECONDS = 90
 
 _ollama_available: Optional[bool] = None
 

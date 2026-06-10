@@ -10,7 +10,14 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from config import HOST, PORT, LOG_LEVEL, MAX_MBOX_SIZE_MB
-from database import init_db, close_db, upsert_email, query_emails, get_supplier_by_domain, upsert_supplier
+from database import (
+    init_db, close_db, upsert_email, query_emails,
+    get_supplier_by_domain, upsert_supplier,
+    queue_emails_for_nlp, get_next_nlp_pending, mark_nlp_processing,
+    save_nlp_result, mark_nlp_failed, get_nlp_results, get_nlp_queue_stats,
+    run_migration_002, run_migration_003,
+    get_or_create_supplier_by_folder, list_suppliers_with_stats,
+)
 from models import (
     HealthResponse, MboxParseRequest, MboxParseResponse,
     NlpExtractRequest, NlpExtractResponse, NlpClassifyRequest, NlpClassifyResponse,
@@ -37,10 +44,16 @@ async def lifespan(app: FastAPI):
     global _start_time
     logger.info("RFQ Flow Python Service starting...")
     await init_db()
+    await run_migration_002()
+    await run_migration_003()
     _start_time = time.time()
     logger.info("Service ready on %s:%d", HOST, PORT)
+    # Start background NLP worker
+    asyncio.create_task(_nlp_background_worker())
+    logger.info("Background NLP worker started")
     yield
     logger.info("Service shutting down...")
+    _shutting_down = True
     await close_db()
     logger.info("Service stopped")
 
@@ -290,6 +303,155 @@ async def nlp_classify_step(request: NlpClassifyRequest):
                 has_conflict=False,
             ),
         )
+
+
+# ── Background NLP Worker ──
+async def _nlp_background_worker():
+    """Background worker: processes one email every 5 minutes with LLM.
+    Runs continuously while the service is up."""
+    # Wait a bit for service to fully start
+    await asyncio.sleep(10)
+
+    while not _shutting_down:
+        try:
+            # Check if Ollama is available
+            from ai.ollama_client import is_available
+            if not is_available():
+                logger.debug("[BG-NLP] Ollama not available, skipping")
+                await asyncio.sleep(300)  # Check again in 5 min
+                continue
+
+            # Get next pending email
+            email = await get_next_nlp_pending()
+            if not email:
+                logger.debug("[BG-NLP] No pending emails in queue")
+                await asyncio.sleep(300)  # Check again in 5 min
+                continue
+
+            email_id = email["id"]
+            message_id = email["message_id"]
+            logger.info("[BG-NLP] Processing email %d (msg_id=%s): %s",
+                        email_id, message_id[:30], email["subject"][:50])
+
+            # Mark as processing
+            await mark_nlp_processing(email_id)
+
+            # Run LLM enrichment (extract + classify in parallel)
+            sender_domain = email["sender_email"].split("@")[-1] if "@" in email["sender_email"] else ""
+            t0 = time.time()
+
+            try:
+                extracted = extract_rfq(
+                    subject=email["subject"] or "",
+                    body_text=email["body_text"] or "",
+                    sender_domain=sender_domain,
+                    body_language=email.get("body_language"),
+                )
+                classification = classify_step(
+                    subject=email["subject"] or "",
+                    body_text=email["body_text"] or "",
+                    has_attachments=False,
+                    previous_emails=None,
+                )
+                dt = time.time() - t0
+
+                # Build result
+                result = {
+                    "supplier_name": extracted.get("supplier_name"),
+                    "supplier_confidence": extracted.get("supplier_name_confidence", 0),
+                    "part_numbers": [p.get("part_number", str(p)) if isinstance(p, dict) else str(p)
+                                     for p in extracted.get("part_numbers", [])],
+                    "step": classification.get("suggested_step", 0),
+                    "step_name": classification.get("step_name", ""),
+                    "confidence": classification.get("confidence", 0),
+                    "reason": classification.get("reason", ""),
+                    "processing_time_ms": int(dt * 1000),
+                }
+
+                await save_nlp_result(email_id, result)
+                logger.info("[BG-NLP] Email %d enriched in %.1fs: step=%d, supplier=%s, conf=%.2f",
+                            email_id, dt, result["step"], result["supplier_name"] or "-",
+                            result["confidence"])
+
+            except Exception as e:
+                logger.error("[BG-NLP] Email %d enrichment failed: %s", email_id, e)
+                await mark_nlp_failed(email_id)
+
+            # Wait 5 minutes before processing next email
+            await asyncio.sleep(300)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("[BG-NLP] Worker error: %s", e)
+            await asyncio.sleep(300)
+
+    logger.info("[BG-NLP] Background worker stopped")
+
+
+# ── NLP Queue API ──
+
+@app.post("/nlp/queue")
+async def nlp_queue_emails(request: dict):
+    """Queue emails for background LLM enrichment.
+    Call this after loading emails from Thunderbird."""
+    message_ids = request.get("message_ids", [])
+    if not message_ids:
+        return {"queued": 0, "message": "No message IDs provided"}
+
+    queued = await queue_emails_for_nlp(message_ids)
+    stats = await get_nlp_queue_stats()
+    logger.info("[NLP-QUEUE] Queued %d emails for background enrichment. Stats: %s", queued, stats)
+    return {"queued": queued, "stats": stats}
+
+
+@app.post("/nlp/results")
+async def nlp_get_results(request: dict):
+    """Get NLP enrichment results for given message IDs.
+    UI polls this every 30 seconds to update badges."""
+    message_ids = request.get("message_ids", [])
+    results = await get_nlp_results(message_ids)
+    return {"results": results, "count": len(results)}
+
+
+@app.get("/nlp/stats")
+async def nlp_get_stats():
+    """Get NLP queue statistics for the status bar."""
+    stats = await get_nlp_queue_stats()
+    return {"stats": stats}
+
+
+# ── Cross-Mailbox Supplier Matching ──
+
+@app.post("/db/supplier-by-folder")
+async def db_supplier_by_folder(request: dict):
+    """Get or create supplier by folder name.
+    Same folder name across different mailboxes = same supplier."""
+    folder_name = request.get("folder_name", "")
+    email_domain = request.get("email_domain", "")
+    sender_email = request.get("sender_email", "")
+
+    if not folder_name:
+        raise HTTPException(status_code=422, detail="folder_name required")
+
+    result = await get_or_create_supplier_by_folder(
+        folder_name=folder_name,
+        email_domain=email_domain,
+        sender_email=sender_email,
+    )
+    return {
+        "success": True,
+        "supplier_id": result["supplier_id"],
+        "name": result["name"],
+        "action": result["action"],
+    }
+
+
+@app.get("/db/suppliers")
+async def db_list_suppliers():
+    """List all suppliers with email counts (across all mailboxes)."""
+    suppliers = await list_suppliers_with_stats()
+    return {"suppliers": suppliers, "count": len(suppliers)}
 
 
 # ── Run ──

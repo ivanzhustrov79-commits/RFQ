@@ -2,7 +2,18 @@
 import { useApp } from '@/context/AppContext';
 import { useState } from 'react';
 import { X, AlertTriangle, Wand2, CheckSquare, Square, Check } from 'lucide-react';
-import { format, parseISO } from 'date-fns';
+import { format, isValid } from 'date-fns';
+
+function safeFormat(dateValue: string | Date | null | undefined, fmt: string = 'MMM d, HH:mm', fallback: string = '—'): string {
+  if (!dateValue) return fallback;
+  try {
+    let date: Date;
+    if (dateValue instanceof Date) { date = dateValue; }
+    else if (typeof dateValue === 'string' && (dateValue.includes('T') || dateValue.match(/^\d{4}-\d{2}-\d{2}/))) { date = new Date(dateValue); }
+    else { date = new Date(dateValue); }
+    return isValid(date) ? format(date, fmt) : fallback;
+  } catch { return fallback; }
+}
 
 export function ExceptionQueuePanel() {
   const { state, dispatch } = useApp();
@@ -59,7 +70,7 @@ export function ExceptionQueuePanel() {
                   <p className="text-small mt-0.5" style={{ color: 'var(--amber-alert)' }}>{ex.reason}</p>
                   {ex.aiSuggestion && <div className="flex items-start gap-1 mt-1.5 p-1.5 rounded" style={{ backgroundColor: 'rgba(155,91,175,0.1)' }}><Wand2 className="w-3 h-3 shrink-0 mt-0.5" style={{ color: 'var(--plum-accent)'}} /><p className="text-micro" style={{ color: 'var(--plum-accent)' }}>{ex.aiSuggestion}</p></div>}
                   <div className="flex items-center justify-between mt-2">
-                    <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>{format(parseISO(ex.createdAt), 'MMM d, HH:mm')}</span>
+                    <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>{safeFormat(ex.createdAt, 'MMM d, HH:mm')}</span>
                     <button onClick={() => dispatch({ type: 'RESOLVE_EXCEPTION', payload: ex.id })} className="text-micro px-2 py-0.5 rounded-md" style={{ backgroundColor: 'var(--green-success)', color: 'black' }}>Resolve</button>
                   </div>
                 </div>

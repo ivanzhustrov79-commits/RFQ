@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Mail, RefreshCw, AlertCircle, FolderOpen, ChevronDown, ChevronRight, Inbox, Check, Eye, EyeOff } from 'lucide-react';
 
 interface MboxFile {
@@ -35,38 +35,54 @@ interface ProfileData {
 
 export function ThunderbirdPanel() {
   const { state, dispatch } = useApp();
-  const [scanning, setScanning] = useState(false);
+  const [scanning, setScanning] = useState(!state.thunderbirdData);
   const [error, setError] = useState<string | null>(null);
   const [expandedAccounts, setExpandedAccounts] = useState<Set<string>>(new Set());
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [loadingMbox, setLoadingMbox] = useState<string | null>(null);
   const [showHidden, setShowHidden] = useState(false);
 
+  // ── Send synced folder paths to main process for health checks ──
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.thunderbird?.setSyncedPaths) {
+      api.thunderbird.setSyncedPaths(state.syncedFolderPaths);
+    }
+  }, [state.syncedFolderPaths, state.syncedFolders]);
+
+  // ── Listen for auto-sync events from main process ──
+  // Sync errors only - auto-sync and folder updates handled in AppContext
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api?.thunderbird?.onSyncError) return;
+    api.thunderbird.onSyncError((err: string) => {
+      setScanning(false);
+      setError(err);
+    });
+  }, []);
+
   const handleClose = () => { dispatch({ type: 'TOGGLE_THUNDERBIRD_PANEL' }); };
   const handleHideAccount = (accountName: string) => { dispatch({ type: 'TOGGLE_HIDDEN_ACCOUNT', payload: accountName }); };
 
-  const handleDiscover = async () => {
-    setScanning(true);
+  const handleReadMbox = async (mboxPath: string, syncKey: string) => {
+    setLoadingMbox(mboxPath);
     setError(null);
-    setLoadingMbox(null);
     try {
-      const result = await window.electronAPI.thunderbird.discover();
-      if (result && result.profiles) {
-        dispatch({ type: 'SET_THUNDERBIRD_DATA', payload: result });
+      const folderName = mboxPath.split(/[\\/]/).pop()?.replace(/\.sbd$/i, '') || '';
+      const result = await window.electronAPI.thunderbird.readMbox(mboxPath, 10000, folderName);
+      if (result.success && result.emails) {
+        dispatch({ type: 'SET_REAL_EMAILS', payload: result.emails });
+        dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
+        dispatch({ type: 'SET_SYNCED_FOLDER_PATH', payload: { syncKey, mboxPath } });
+        if (!state.useRealData) dispatch({ type: 'TOGGLE_DATA_SOURCE' });
+      } else {
+        setError(result.error || 'Failed to read MBOX');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Discover failed');
+      setError(err instanceof Error ? err.message : 'Failed to read');
     } finally {
-      setScanning(false);
+      setLoadingMbox(null);
     }
-  };
-
-  const toggleAccount = (key: string) => {
-    setExpandedAccounts(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
-  };
-
-  const toggleFolder = (key: string) => {
-    setExpandedFolders(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
   };
 
   const handleToggleSync = (syncKey: string, mboxPath?: string) => {
@@ -82,23 +98,12 @@ export function ThunderbirdPanel() {
     }
   };
 
-  const handleReadMbox = async (mboxPath: string, syncKey: string) => {
-    setLoadingMbox(mboxPath);
-    setError(null);
-    try {
-      const result = await window.electronAPI.thunderbird.readMbox(mboxPath, 10000);
-      if (result.success && result.emails) {
-        dispatch({ type: 'SET_REAL_EMAILS', payload: result.emails });
-        dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
-        if (!state.useRealData) dispatch({ type: 'TOGGLE_DATA_SOURCE' });
-      } else {
-        setError(result.error || 'Failed to read MBOX');
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to read');
-    } finally {
-      setLoadingMbox(null);
-    }
+  const toggleAccount = (key: string) => {
+    setExpandedAccounts(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
+  };
+
+  const toggleFolder = (key: string) => {
+    setExpandedFolders(p => { const n = new Set(p); n.has(key) ? n.delete(key) : n.add(key); return n; });
   };
 
   if (!state.isThunderbirdPanelOpen) return null;
@@ -115,9 +120,9 @@ export function ThunderbirdPanel() {
             <h2 className="text-h1 font-semibold" style={{ color: 'var(--text-primary)' }}>Thunderbird</h2>
           </div>
           <div className="flex items-center gap-1">
-            <button onClick={handleDiscover} disabled={scanning} className="p-1.5 rounded-md hover:bg-white/10 disabled:opacity-40" title="Rescan">
-              <RefreshCw className={`w-4 h-4 ${scanning ? 'animate-spin' : ''}`} style={{ color: 'var(--text-secondary)' }} />
-            </button>
+            {scanning && (
+              <RefreshCw className="w-4 h-4 animate-spin" style={{ color: 'var(--plum-accent)' }} />
+            )}
             <button onClick={handleClose} className="p-1.5 rounded-md hover:bg-white/10" title="Close">
               <X className="w-5 h-5" style={{ color: 'var(--text-secondary)' }} />
             </button>
@@ -125,20 +130,11 @@ export function ThunderbirdPanel() {
         </div>
 
         <div className="flex-1 overflow-y-auto custom-scrollbar py-2">
-          {!state.thunderbirdData && !scanning && (
-            <div className="flex flex-col items-center justify-center py-16 px-4">
-              <Mail className="w-12 h-12 mb-4" style={{ color: 'var(--text-tertiary)' }} />
-              <p className="text-body font-medium mb-4" style={{ color: 'var(--text-secondary)' }}>No Thunderbird data</p>
-              <button onClick={handleDiscover} className="flex items-center gap-2 px-4 py-2 rounded-md text-small font-medium" style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}>
-                <RefreshCw className="w-4 h-4" /> Scan Thunderbird
-              </button>
-            </div>
-          )}
-
-          {scanning && (
+          {scanning && !state.thunderbirdData && (
             <div className="flex flex-col items-center justify-center py-16">
               <RefreshCw className="w-8 h-8 animate-spin mb-3" style={{ color: 'var(--plum-accent)' }} />
-              <p className="text-body" style={{ color: 'var(--text-secondary)' }}>Scanning...</p>
+              <p className="text-body" style={{ color: 'var(--text-secondary)' }}>Syncing with Thunderbird...</p>
+              <p className="text-micro mt-1" style={{ color: 'var(--text-tertiary)' }}>Auto-syncs every 5 minutes</p>
             </div>
           )}
 

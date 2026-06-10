@@ -2,7 +2,18 @@
 import { useApp } from '@/context/AppContext';
 import { useState } from 'react';
 import { X, Bell, Clock } from 'lucide-react';
-import { format, parseISO } from 'date-fns';
+import { format, isValid } from 'date-fns';
+
+function safeFormat(dateValue: string | Date | null | undefined, fmt: string = 'MMM d, HH:mm', fallback: string = '—'): string {
+  if (!dateValue) return fallback;
+  try {
+    let date: Date;
+    if (dateValue instanceof Date) { date = dateValue; }
+    else if (typeof dateValue === 'string' && (dateValue.includes('T') || dateValue.match(/^\d{4}-\d{2}-\d{2}/))) { date = new Date(dateValue); }
+    else { date = new Date(dateValue); }
+    return isValid(date) ? format(date, fmt) : fallback;
+  } catch { return fallback; }
+}
 
 export function AlarmBoard() {
   const { state, dispatch } = useApp();
@@ -57,7 +68,7 @@ function AlarmItem({ alarm, isActive }: { alarm: { id: number; rfqId: number; al
       <p className="text-small" style={{ color: 'var(--text-secondary)' }}>{alarm.reason}</p>
       {rfq && <p className="text-micro truncate" style={{ color: 'var(--plum-accent)' }}>{rfq.rfqName}</p>}
       <div className="flex items-center justify-between mt-0.5">
-        <div className="flex items-center gap-1 text-micro" style={{ color: 'var(--text-tertiary)' }}><Clock className="w-3 h-3" />{format(parseISO(alarm.createdAt), 'MMM d, HH:mm')}</div>
+        <div className="flex items-center gap-1 text-micro" style={{ color: 'var(--text-tertiary)' }}><Clock className="w-3 h-3" />{safeFormat(alarm.createdAt, 'MMM d, HH:mm')}</div>
         {isActive && <button onClick={() => dispatch({ type: 'DISMISS_ALARM', payload: alarm.id })} className="text-micro px-2 py-0.5 rounded transition-colors hover:bg-white/10" style={{ color: 'var(--text-secondary)' }}>Dismiss</button>}
       </div>
     </div>
