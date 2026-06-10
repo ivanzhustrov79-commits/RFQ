@@ -553,3 +553,68 @@ async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
     """)
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
+# ── Missing Functions Required by main.py ──
+
+async def get_or_create_supplier_by_folder(folder_name: str, email_domain: str, sender_email: str) -> Dict[str, Any]:
+    """Get or create supplier by folder name. Same folder name = same supplier."""
+    db = await get_db()
+    
+    # Try to find by name first (folder_name is used as supplier name)
+    cursor = await db.execute("SELECT id, name FROM suppliers WHERE name = ?", (folder_name,))
+    existing = await cursor.fetchone()
+    
+    if existing:
+        return {"supplier_id": existing["id"], "name": existing["name"], "action": "existing"}
+    
+    # If not found, create new supplier
+    # Use email_domain if available, otherwise generate a dummy one to satisfy UNIQUE constraint
+    domain = email_domain or f"{folder_name.lower().replace(' ', '_')}@unknown.local"
+    
+    cursor = await db.execute("""
+        INSERT INTO suppliers (name, email_domain, contact_email, default_currency)
+        VALUES (?, ?, ?, 'USD')
+    """, (folder_name, domain, sender_email or None))
+    await db.commit()
+    
+    return {"supplier_id": cursor.lastrowid, "name": folder_name, "action": "inserted"}
+
+async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
+    """List all suppliers with their email counts and open RFQ counts."""
+    db = await get_db()
+    
+    cursor = await db.execute("""
+        SELECT 
+            s.id,
+            s.name,
+            s.email_domain,
+            s.contact_email,
+            s.default_currency,
+            COUNT(e.id) as email_count,
+            SUM(CASE WHEN e.step_assigned < 4 THEN 1 ELSE 0 END) as open_rfq_count
+        FROM suppliers s
+        LEFT JOIN emails e ON s.id = e.supplier_id
+        GROUP BY s.id
+        ORDER BY s.name
+    """)
+    
+    rows = await cursor.fetchall()
+    suppliers = []
+    for row in rows:
+        suppliers.append({
+            "id": row["id"],
+            "name": row["name"],
+            "email_domain": row["email_domain"],
+            "contact_email": row["contact_email"],
+            "default_currency": row["default_currency"],
+            "email_count": row["email_count"] or 0,
+            "openRfqCount": row["open_rfq_count"] or 0,
+        })
+    
+    return suppliers
+
+async def update_email_step(email_id: int, new_step: int) -> Dict[str, Any]:
+    """Update the workflow step for a specific email (Step Override)."""
+    db = await get_db()
+    await db.execute("UPDATE emails SET step_assigned = ? WHERE id = ?", (new_step, email_id))
+    await db.commit()
+    return {"success": True, "email_id": email_id, "new_step": new_step}

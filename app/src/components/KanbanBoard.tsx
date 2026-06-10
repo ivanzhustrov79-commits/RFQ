@@ -17,7 +17,7 @@ const workflowSteps = [
 export function KanbanBoard() {
   const { state, dispatch, getFilteredEmails } = useApp();
   const filteredEmails = getFilteredEmails() || [];
-  const [contextMenu, setContextMenu] = useState<<{
+  const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
     email: Email | null;
@@ -120,6 +120,55 @@ export function KanbanBoard() {
               boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
             }}
           >
+            
+            {/* ── NEW: MOVE TO STEP OVERRIDE ── */}
+<div className="px-3 py-1 text-micro uppercase tracking-wider" style={{color: 'var(--text-tertiary)'}}>
+  Move to Step
+</div>
+{[
+  { id: 0, name: '0: New / Inbox' },
+  { id: 1, name: '1: RFQ Sent' },
+  { id: 2, name: '2: Offer Received' },
+  { id: 3, name: '3: PI Issued' },
+  { id: 4, name: '4: Payment Sent' },
+  { id: 5, name: '5: Delivery / Closed' },
+].map(step => (
+  <button
+    key={step.id}
+    className="w-full text-left px-3 py-1.5 text-body transition-colors hover:bg-[var(--brand-plum)] hover:text-white"
+    style={{
+      color: 'var(--text-secondary)',
+      backgroundColor: contextMenu.email?.stepAssigned === step.id ? 'rgba(107,61,139,0.2)' : 'transparent'
+    }}
+    onClick={async () => {
+      if (!contextMenu.email) return;
+      const emailId = contextMenu.email.id;
+
+      // 1. Update local state instantly for snappy UI
+      dispatch({ type: 'UPDATE_EMAIL_STEP', payload: { emailId, newStep: step.id } });
+
+      // 2. Save to Python backend
+      try {
+        await fetch(`http://127.0.0.1:8721/db/emails/${emailId}/step`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ step: step.id }),
+        });
+      } catch (err) {
+        console.error('Failed to update step:', err);
+      }
+
+      setContextMenu(null); // Close the menu
+    }}
+  >
+    {step.name}
+  </button>
+))}
+
+{/* Divider line */}
+<div className="my-1 border-t" style={{ borderColor: 'var(--border-color)' }}></div>
+{/* ── END MOVE TO STEP ── */}
+
             <div className="px-3 py-1 text-micro uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
               Email Level 1
             </div>

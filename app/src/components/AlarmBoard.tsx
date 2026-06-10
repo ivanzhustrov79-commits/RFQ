@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { X, Bell, Clock } from 'lucide-react';
 import { format, isValid } from 'date-fns';
 
@@ -17,15 +17,32 @@ function safeFormat(dateValue: string | Date | null | undefined, fmt: string = '
 
 export function AlarmBoard() {
   const { state, dispatch } = useApp();
-  const [visible, setVisible] = useState(false);
+  
+  // ✅ Use ONLY this one state variable (make sure the old 'visible' one is deleted!)
+  const [isVisible, setIsVisible] = useState(false);
+  
   const activeAlarms = state.alarms.filter(a => a.isActive);
   const dismissedAlarms = state.alarms.filter(a => !a.isActive);
 
-  if (state.isAlarmBoardOpen && !visible) setTimeout(() => setVisible(true), 10);
-  if (!state.isAlarmBoardOpen && visible) setTimeout(() => setVisible(false), 0);
-  if (!state.isAlarmBoardOpen && !visible) return null;
+  // ✅ FIXED: Moved setTimeout into useEffect to prevent render corruption
+useEffect(() => {
+  if (state.isAlarmBoardOpen && !isVisible) {
+    const timer = setTimeout(() => setIsVisible(true), 10);
+    return () => clearTimeout(timer);
+  }
+  if (!state.isAlarmBoardOpen && isVisible) {
+    const timer = setTimeout(() => setIsVisible(false), 0);
+    return () => clearTimeout(timer);
+  }
+}, [state.isAlarmBoardOpen, isVisible]);
 
-  const handleClose = () => { setVisible(false); setTimeout(() => dispatch({ type: 'TOGGLE_ALARM_BOARD' }), 250); };
+if (!state.isAlarmBoardOpen && !isVisible) return null;
+
+  const handleClose = () => { 
+    setIsVisible(false); // ✅ Make sure this uses setIsVisible, not setVisible!
+    setTimeout(() => dispatch({ type: 'TOGGLE_ALARM_BOARD' }), 250); 
+  };
+
 
   return (
     <>

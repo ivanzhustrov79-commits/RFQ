@@ -17,6 +17,7 @@ from database import (
     save_nlp_result, mark_nlp_failed, get_nlp_results, get_nlp_queue_stats,
     run_migration_002, run_migration_003,
     get_or_create_supplier_by_folder, list_suppliers_with_stats,
+    update_email_step, # <--- ADD THIS LINE
 )
 from models import (
     HealthResponse, MboxParseRequest, MboxParseResponse,
@@ -453,6 +454,16 @@ async def db_list_suppliers():
     suppliers = await list_suppliers_with_stats()
     return {"suppliers": suppliers, "count": len(suppliers)}
 
+# ── Step Override API ──
+@app.patch("/db/emails/{email_id}/step")
+async def db_update_email_step(email_id: int, request: dict):
+    """Update the workflow step for an email (Manual Step Override)."""
+    new_step = request.get("step")
+    if new_step is None or not isinstance(new_step, int) or new_step < 0 or new_step > 6:
+        raise HTTPException(status_code=400, detail="Invalid step (must be 0-6)")
+
+    result = await update_email_step(email_id, new_step)
+    return result
 
 # ── Run ──
 if __name__ == "__main__":
