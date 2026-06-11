@@ -9,9 +9,9 @@ let mainWindow;
 const GREY_NAMES = new Set(['sent','drafts','trash','outbox','junk','spam','archive','templates','queue','корзина','черновики','отправленные']);
 const SKIP_FOLDERS = new Set(['news','2026']);
 
-// Accounts/domains to skip (old/junk accounts)
-// User actively uses: commercial@field-pro.ae, izhustrov@europa-parts.kz, izhustrov@import-detal36.ru
-const SKIP_ACCOUNTS = new Set([
+// Accounts to skip — initially hardcoded, overridden by renderer via IPC
+// User can toggle accounts on/off in SupplierPane
+let _skippedAccounts = new Set([
   'eivanova@europa-parts.kz',
   'eivanova@import-detal36.ru',
   'eivanova@agro-pro2014.ru',
@@ -21,6 +21,8 @@ const SKIP_ACCOUNTS = new Set([
   'yandex.com',
   'pop3.field-pro.ae',
 ]);
+// Keep original as fallback reference
+const SKIP_ACCOUNTS = _skippedAccounts;
 
 // ── Python NLP Service Configuration ──
 const PYTHON_HOST = '127.0.0.1';
@@ -611,10 +613,10 @@ function findThunderbirdProfiles() {
           }
           if (!displayName) displayName = ent.name.replace(/^imap\./, '').replace(/^pop\./, '');
 
-          // Skip known junk accounts
+          // Skip accounts disabled by user
           const displayNameLower = (displayName || '').toLowerCase();
-          if (SKIP_ACCOUNTS.has(displayNameLower) || SKIP_ACCOUNTS.has(displayName)) {
-            console.log('[TB] Skipping junk account:', displayName);
+          if (_skippedAccounts.has(displayNameLower) || _skippedAccounts.has(displayName)) {
+            console.log('[TB] Skipping account:', displayName);
             continue;
           }
 
@@ -870,6 +872,47 @@ ipcMain.handle('thunderbird:discover', () => {
   }
 });
 
+ipcMain.handle('thunderbird:listMboxes', () => {
+  // Returns flat list of all available MBOX files across all profiles/accounts
+  // Each entry: { syncKey, mboxPath, name, accountName, totalEmails }
+  try {
+    const result = findThunderbirdProfiles();
+    const mboxes = [];
+
+    for (const profile of (result.profiles || [])) {
+      for (const account of (profile.trees || [])) {
+        // Flatten children recursively
+        function flattenChildren(children, prefix) {
+          for (const child of (children || [])) {
+            const syncKey = `${profile.name}/${account.name}/${prefix}${child.name}/${child.name}`;
+            const mboxPath = child.path || '';
+            if (mboxPath && child.totalEmails > 0) {
+              mboxes.push({
+                syncKey,
+                mboxPath,
+                name: child.name,
+                accountName: account.name,
+                totalEmails: child.totalEmails || 0,
+              });
+            }
+            if (child.children?.length > 0) {
+              flattenChildren(child.children, `${prefix}${child.name}/`);
+            }
+          }
+        }
+        flattenChildren(account.children, '');
+      }
+    }
+
+    // Sort by totalEmails desc
+    mboxes.sort((a, b) => b.totalEmails - a.totalEmails);
+    return { mboxes };
+  } catch (err) {
+    console.error('[TB] listMboxes crash:', err);
+    return { mboxes: [] };
+  }
+});
+
 ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100) => {
   try {
     const stats = fs.statSync(mboxPath);
@@ -926,6 +969,47 @@ let _syncFromDate = null;       // ISO date string filter e.g. "2025-01-01"
 let _autoSyncInterval = null;   // 5-minute timer
 let _isScanning = false;        // prevent overlapping scans
 
+ipcMain.handle('suppliers:list', async () => {
+  try {
+    const result = await callPython('/db/suppliers', null, 'GET');
+    return result;
+  } catch (err) {
+    console.log('[SUPPLIERS] Failed to fetch:', err.message);
+    return { suppliers: [] };
+  }
+});
+
+// ── Account sync management ──
+ipcMain.handle('thunderbird:setSkippedAccounts', (_event, skipped) => {
+  _skippedAccounts = new Set(skipped || []);
+  console.log('[TB-SYNC] Skipped accounts updated:', Array.from(_skippedAccounts));
+});
+
+ipcMain.handle('thunderbird:listAccounts', () => {
+  // Returns all accounts found in Thunderbird profile regardless of skip list
+  // Temporarily clear skip list to get full account list
+  const saved = _skippedAccounts;
+  _skippedAccounts = new Set(); // show everything
+  try {
+    const result = findThunderbirdProfiles();
+    const accounts = [];
+    for (const profile of (result.profiles || [])) {
+      for (const tree of (profile.trees || [])) {
+        accounts.push({
+          name: tree.name,
+          totalEmails: tree.totalEmails || 0,
+          mboxCount: tree.mboxCount || 0,
+        });
+      }
+    }
+    return { accounts };
+  } catch (err) {
+    return { accounts: [] };
+  } finally {
+    _skippedAccounts = saved; // restore
+  }
+});
+
 ipcMain.handle('thunderbird:setSyncFromDate', (_event, date) => {
   _syncFromDate = date || null;
   console.log('[TB-SYNC] Sync-from date set to:', _syncFromDate || 'none');
@@ -941,16 +1025,6 @@ ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
   // kick off a sync immediately so persistEmailsToDB runs without waiting 5 min.
   if (curr > 0 && curr !== prev && pythonAvailable) {
     setTimeout(runThunderbirdSync, 2000);
-  }
-});
-
-ipcMain.handle('suppliers:list', async () => {
-  try {
-    const result = await callPython('/db/suppliers', null, 'GET');
-    return result;
-  } catch (err) {
-    console.log('[SUPPLIERS] Failed to fetch:', err.message);
-    return { suppliers: [] };
   }
 });
 

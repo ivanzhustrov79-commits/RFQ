@@ -77,8 +77,9 @@ interface AppState {
   isSettingsOpen: boolean;
   syncedFolders: Set<string>;
   syncedFolderPaths: Record<string, string>;
-  supplierSyncEnabled: Record<number, boolean>; // supplierId → true/false
-  syncFromDate: string | null; // ISO date string e.g. "2025-01-01"
+  supplierSyncEnabled: Record<number, boolean>;
+  syncFromDate: string | null;
+  skippedAccounts: string[];
   selectedSupplierId: number | null;
   suppliers: any[];
   rfqs: Rfq[];
@@ -111,6 +112,7 @@ type Action =
   | { type: 'SET_SYNCED_FOLDER_PATH'; payload: { syncKey: string; mboxPath: string } }
   | { type: 'SET_SUPPLIER_SYNC'; payload: { supplierId: number; enabled: boolean } }
   | { type: 'SET_SYNC_FROM_DATE'; payload: string | null }
+  | { type: 'SET_SKIPPED_ACCOUNTS'; payload: string[] }
   | { type: 'SELECT_SUPPLIER'; payload: number | null }
   | { type: 'SET_SUPPLIERS'; payload: any[] }
   | { type: 'SELECT_RFQ'; payload: string | null }
@@ -132,7 +134,11 @@ const initialState: AppState = {
   isThunderbirdPanelOpen: false, isAlarmBoardOpen: false,
   isExceptionQueueOpen: false, isTroubleshootOpen: false,
   isSettingsOpen: false, syncedFolders: new Set(), syncedFolderPaths: {},
-  supplierSyncEnabled: {}, syncFromDate: null, suppliers: [],
+  supplierSyncEnabled: {}, syncFromDate: null, skippedAccounts: [
+    'eivanova@europa-parts.kz', 'eivanova@import-detal36.ru', 'eivanova@agro-pro2014.ru',
+    'izhustrov@agro-pro2014.ru', 'logistic@import-detal36.ru', 'logistic@field-pro.ae',
+    'yandex.com', 'pop3.field-pro.ae',
+  ], suppliers: [],
   selectedSupplierId: null, rfqs: [],
   selectedRfqId: null, alarms: [], exceptions: [],
   troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null, hiddenAccounts: new Set(),
@@ -170,6 +176,8 @@ function appReducer(state: AppState, action: Action): AppState {
       return { ...state, supplierSyncEnabled: { ...state.supplierSyncEnabled, [action.payload.supplierId]: action.payload.enabled } };
     case 'SET_SYNC_FROM_DATE':
       return { ...state, syncFromDate: action.payload };
+    case 'SET_SKIPPED_ACCOUNTS':
+      return { ...state, skippedAccounts: action.payload };
     case 'SELECT_SUPPLIER': return { ...state, selectedSupplierId: action.payload };
     case 'SELECT_RFQ': return { ...state, selectedRfqId: action.payload };
     case 'DISMISS_ALARM': return { ...state, alarms: state.alarms.map(a => a.id === action.payload ? { ...a, dismissed: true } : a) };
@@ -250,6 +258,7 @@ function getSavedSettings(): Partial<AppState> {
         rfqNames: p.rfqNames || {},
         supplierSyncEnabled: p.supplierSyncEnabled || {},
         syncFromDate: p.syncFromDate || null,
+        skippedAccounts: p.skippedAccounts || [],
       };
     }
   } catch (e) {}
@@ -266,7 +275,8 @@ function saveSettings(state: AppState) {
       hiddenAccounts: Array.from(state.hiddenAccounts),
       rfqNames: state.rfqNames,
       supplierSyncEnabled: state.supplierSyncEnabled,
-      syncFromDate: state.syncFromDate,   // ← persist AI/manual names across sessions
+      syncFromDate: state.syncFromDate,
+      skippedAccounts: state.skippedAccounts,   // ← persist AI/manual names across sessions
     }));
   } catch (e) {}
 }
@@ -276,6 +286,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // Track which supplier IDs we've already requested a name for (avoids duplicate calls)
   const nameRequestedRef = useRef<Set<number>>(new Set());
+
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (api?.thunderbird?.setSkippedAccounts) {
+      api.thunderbird.setSkippedAccounts(state.skippedAccounts);
+    }
+  }, [state.skippedAccounts]);
 
   useEffect(() => {
     const api = (window as any).electronAPI;
