@@ -58,7 +58,7 @@ declare global {
     electronAPI: {
       thunderbird: {
         discover: () => Promise<DiscoverResult>;
-        readMbox: (mboxPath: string, maxEmails?: number, folderName?: string) => PromiseReadMboxResult>;
+        readMbox: (mboxPath: string, maxEmails?: number, folderName?: string) => Promise<ReadMboxResult>;
         setSyncedPaths: (paths: Record<string, string>) => Promise<void>;
         onAutoSync: (callback: (data: any) => void) => void;
         onFolderUpdate: (callback: (data: any) => void) => void;
@@ -68,11 +68,9 @@ declare global {
         list: () => Promise<{ suppliers: any[]; count: number; error?: string }>;
       };
       nlp: {
-        onResults: (callback: (results: Record<string, any>) => void) => void;
-        onStats: (callback: (stats: { pending: number; processing: number; completed: number; failed: number }) => void) => void;
+        onResults: (callback: (results: any) => void) => void;
+        onStats: (callback: (stats: any) => void) => void;
       };
     };
   }
 }
-
-export {};

@@ -89,6 +89,65 @@ async function queueEmailsForBackgroundNLP(emails) {
   }
 }
 
+// ── Persist emails to SQLite via Python backend ──
+async function persistEmailsToDB(emails, syncKey) {
+  if (!pythonAvailable || !emails || emails.length === 0) return;
+
+  const parts = syncKey ? syncKey.split('::') : [];
+  const accountEmail = parts[0] || 'unknown';
+  const folderPath = parts[1] || 'inbox';
+
+  // Extract folder name for supplier matching (last path segment)
+  const folderName = syncKey.split('/').pop() || 'inbox';
+
+  let stored = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  // Process in small batches to avoid overwhelming the Python server
+  const BATCH_SIZE = 5;
+  for (let i = 0; i < emails.length; i += BATCH_SIZE) {
+    const batch = emails.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(async (email) => {
+      if (!email.messageId) { skipped++; return; }
+      try {
+        const senderEmail = email.senderEmail || email.from || '';
+        const domain = extractDomain(email.from || senderEmail);
+        // Derive numeric id same way finalizeEmail does
+        const emailId = email.id || (email.messageId
+          ? parseInt(email.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000)
+          : Math.floor(Math.random() * 1000000));
+
+        await callPython('/db/email', {
+          id: emailId,
+          profile_name: 'default',
+          account_email: accountEmail,
+          folder_path: folderName,
+          message_id: email.messageId,
+          subject: email.subject || '(no subject)',
+          sender_email: senderEmail,
+          sender_name: email.senderName || senderEmail.split('@')[0] || '',
+          sender_domain: domain || 'unknown',
+          sent_at: email.sentAt || email.date || new Date().toISOString(),
+          body_text: email.body || '',
+          body_language: null,
+          has_attachments: false,
+          thread_id: email.threadId || null,
+          step_assigned: email.stepAssigned || 0,
+          rfq_id: null,
+          supplier_id: email.supplierId || null,
+        });
+        stored++;
+      } catch (e) {
+        failed++;
+        if (failed <= 2) console.log('[DB-PERSIST] Failed for %s: %s', email.messageId?.substring(0, 20), e.message.substring(0, 120));
+      }
+    }));
+  }
+
+  console.log('[DB-PERSIST] Stored %d, skipped %d, failed %d (folder: %s)', stored, skipped, failed, folderName);
+}
+
 let _nlpPollInterval = null;
 const _pendingNlpMessageIds = new Set();
 
@@ -729,7 +788,6 @@ function finalizeEmail(e) {
   // Initialize NLP fields
   e.extracted = { supplier: null, partNumbers: [] };
   e.classification = { step: 0, confidence: 0 };
-  e.supplierName = ''; // Will be set by cross-mailbox supplier matching
   return e;
 }
 
@@ -742,72 +800,16 @@ ipcMain.handle('thunderbird:discover', () => {
   }
 });
 
-// Helper: extract folder name from mbox path (e.g., ".../Mail/account/Supplier Name")
-function extractFolderNameFromPath(mboxPath) {
-  try {
-    // Get the parent directory name (which is the folder name in Thunderbird)
-    const parentDir = path.basename(path.dirname(mboxPath));
-    // Also try the file name itself (for top-level folders)
-    const fileName = path.basename(mboxPath, '.sbd');
-    // Use parent dir if it's meaningful, otherwise file name
-    if (parentDir && parentDir !== 'Mail' && parentDir !== 'ImapMail') {
-      return parentDir;
-    }
-    return fileName;
-  } catch {
-    return '';
-  }
-}
-
-ipcMain.handle('suppliers:list', async () => {
-  if (!pythonAvailable) return { suppliers: [], count: 0 };
-  try {
-    const result = await callPython('/db/suppliers', null, 'GET');
-    return { suppliers: result.suppliers || [], count: result.count || 0 };
-  } catch (err) {
-    console.log('[SUPPLIERS-IPC] Failed:', err.message);
-    return { suppliers: [], count: 0, error: err.message };
-  }
-});
-
-ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100, folderName = '') => {
+ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100) => {
   try {
     const stats = fs.statSync(mboxPath);
     if (stats.size > 500 * 1024 * 1024) return { success: false, error: 'File too large (>500MB)' };
     const content = fs.readFileSync(mboxPath, 'utf8');
     const emails = parseMboxEmails(content, maxEmails);
 
-    // ── Cross-mailbox supplier matching ──
-    // Tag all emails with supplier based on folder name
-    const effectiveFolderName = folderName || extractFolderNameFromPath(mboxPath);
-    if (pythonAvailable && emails.length > 0 && effectiveFolderName) {
-      try {
-        // Get supplier from first email's sender domain
-        const firstEmail = emails[0];
-        const senderEmail = firstEmail.senderEmail || firstEmail.from || '';
-        const senderDomain = extractDomain(senderEmail);
-
-        const supplierResult = await callPython('/db/supplier-by-folder', {
-          folder_name: effectiveFolderName,
-          email_domain: senderDomain,
-          sender_email: senderEmail,
-        });
-
-        // Tag all emails with supplier_id
-        for (const email of emails) {
-          email.supplierId = supplierResult.supplier_id;
-          email.supplierName = supplierResult.name;
-        }
-        console.log('[TB-SUPPLIER] Folder "%s" → supplier_id=%d (%s), emails=%d',
-          effectiveFolderName, supplierResult.supplier_id, supplierResult.name, emails.length);
-      } catch (supplierErr) {
-        console.log('[TB-SUPPLIER] Failed to match supplier: %s', supplierErr.message);
-        // Continue without supplier tagging
-      }
-    }
-
     // ── Queue emails for background NLP enrichment ──
     if (pythonAvailable && emails.length > 0) {
+      persistEmailsToDB(emails, mboxPath).catch(() => {});
       queueEmailsForBackgroundNLP(emails).catch(err => {
         console.log('[NLP-QUEUE] Failed:', err.message);
       });
@@ -855,8 +857,27 @@ let _isScanning = false;        // prevent overlapping scans
 
 // Receive synced folder paths from renderer (for health checks)
 ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
+  const prev = Object.keys(_syncedFolderPaths).length;
   _syncedFolderPaths = paths || {};
-  console.log('[TB-SYNC] Received %d synced folder paths', Object.keys(_syncedFolderPaths).length);
+  const curr = Object.keys(_syncedFolderPaths).length;
+  console.log('[TB-SYNC] Received %d synced folder paths', curr);
+
+  // If we just received paths for the first time (or gained new ones),
+  // kick off a sync immediately so persistEmailsToDB runs without waiting 5 min.
+  if (curr > 0 && curr !== prev && pythonAvailable) {
+    setTimeout(runThunderbirdSync, 2000);
+  }
+});
+
+// ── Suppliers: fetch from Python backend ──
+ipcMain.handle('suppliers:list', async () => {
+  try {
+    const result = await callPython('/db/suppliers', null, 'GET');
+    return result;
+  } catch (err) {
+    console.log('[SUPPLIERS] Failed to fetch:', err.message);
+    return { suppliers: [] };
+  }
 });
 
 // Perform full Thunderbird sync + health check
@@ -902,14 +923,20 @@ async function runThunderbirdSync() {
       result.profiles.length, missingFolders.length, Date.now() - t0);
 
     // Auto-reload synced folders that are still healthy
+    console.log('[TB-SYNC] Reloading %d synced folders: %j', Object.keys(_syncedFolderPaths).length, Object.keys(_syncedFolderPaths));
     for (const [syncKey, mboxPath] of Object.entries(_syncedFolderPaths)) {
       if (missingFolders.includes(syncKey)) continue;
       try {
         const stats = fs.statSync(mboxPath);
-        if (stats.size > 500 * 1024 * 1024) continue;
+        console.log('[TB-SYNC] Reloading folder %s: %s (%d bytes)', syncKey, mboxPath, stats.size);
+        if (stats.size > 500 * 1024 * 1024) { console.log('[TB-SYNC] Skipping %s: too large', syncKey); continue; }
         const content = fs.readFileSync(mboxPath, 'utf8');
         const emails = parseMboxEmails(content, 10000);
         if (emails.length > 0) {
+          // Persist to SQLite first (so NLP worker has body_text)
+          if (pythonAvailable) {
+            persistEmailsToDB(emails, syncKey).catch(() => {});
+          }
           // Queue for NLP
           if (pythonAvailable) {
             queueEmailsForBackgroundNLP(emails).catch(() => {});
@@ -936,8 +963,8 @@ async function runThunderbirdSync() {
 function startAutoSync() {
   if (_autoSyncInterval) return;
   console.log('[TB-SYNC] Starting auto-sync (every 5 minutes)');
-  // First scan after 3 seconds (let renderer settle)
-  setTimeout(runThunderbirdSync, 3000);
+  // First scan after 15 seconds (let renderer settle and send synced paths)
+  setTimeout(runThunderbirdSync, 15000);
   // Then every 5 minutes
   _autoSyncInterval = setInterval(runThunderbirdSync, 5 * 60 * 1000);
 }

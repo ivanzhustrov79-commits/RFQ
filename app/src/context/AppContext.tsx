@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useEffect, useMemo, type ReactNode } from 'react';
+import { createContext, useContext, useReducer, useEffect, useRef, type ReactNode } from 'react';
 
 export interface Email {
   id: number;
@@ -19,37 +19,45 @@ export interface Email {
   isLowConfidence: boolean;
   isProvisional: boolean;
   body?: string;
-  extracted?: { supplier: string | null; partNumbers: string[]; };
-  classification?: { step: number; confidence: number; };
+  extracted?: {
+    supplier: string | null;
+    partNumbers: string[];
+  };
+  classification?: {
+    step: number;
+    confidence: number;
+  };
+  supplierName?: string;
 }
 
-// Fixed interfaces to match SQLite backend (IDs are numbers)
-export interface Supplier { 
-  id: number; 
-  name: string; 
-  email_domain?: string;
-  contact_email?: string;
-  default_currency?: string;
-  email_count?: number;
-  openRfqCount?: number;
-  // legacy fields
-  logo?: string; country?: string; rating?: number; kpi?: any;
-}
-
-export interface Rfq { 
-  id: string; 
-  supplierId: number; 
-  supplierName: string;
+export interface Supplier { id: string; name: string; logo: string; country: string; rating: number; kpi: any; }
+export interface Rfq {
+  id: string;
+  supplierId: number;
   rfqName: string;
-  rfqNameSource: 'auto' | 'manual';
+  rfqNameSource: 'auto' | 'ai' | 'manual';
   ciNumber: string | null;
   status: 'Open' | 'Pending' | 'Approved' | 'Closed';
   currentStep: number;
-  emailCount: number;
   alarmCount: number;
-  parts: any[];
-  // legacy
-  partNumber?: string; description?: string; timestamp?: string; qty?: number;
+  emailCount: number;
+  enrichedCount: number;
+  timestamp: string;
+  partNumbers: string[];
+}
+
+// ── NEW: persisted RFQ name override map ──────────────────────────────────────
+// Key: `supplier-${supplierId}`  Value: { name, source }
+export interface RfqNameEntry {
+  name: string;
+  source: 'ai' | 'manual';
+}
+
+function statusFromStep(step: number): 'Open' | 'Pending' | 'Approved' | 'Closed' {
+  if (step <= 1) return 'Open';
+  if (step <= 4) return 'Pending';
+  if (step >= 5) return 'Approved';
+  return 'Open';
 }
 
 export interface Alarm { id: string; rfqId: string; type: string; message: string; timestamp: string; dismissed: boolean; }
@@ -68,13 +76,11 @@ interface AppState {
   isTroubleshootOpen: boolean;
   isSettingsOpen: boolean;
   syncedFolders: Set<string>;
-  
-  // Fixed types: number instead of string
-  suppliers: Supplier[];
+  syncedFolderPaths: Record<string, string>;
   selectedSupplierId: number | null;
+  suppliers: any[];
   rfqs: Rfq[];
   selectedRfqId: string | null;
-  
   alarms: Alarm[];
   exceptions: Exception[];
   troubleshootChat: ChatMessage[];
@@ -82,6 +88,9 @@ interface AppState {
   componentStatuses: any[];
   troubleshootTarget: { level: number; targetId: string } | null;
   hiddenAccounts: Set<string>;
+  nlpStats: { pending: number; processing: number; completed: number; failed: number };
+  // ── NEW ──
+  rfqNames: Record<string, RfqNameEntry>; // keyed by `supplier-${supplierId}`
 }
 
 type Action =
@@ -89,6 +98,7 @@ type Action =
   | { type: 'SET_FONT_SIZE'; payload: 'small' | 'medium' | 'big' }
   | { type: 'TOGGLE_DATA_SOURCE' }
   | { type: 'SET_REAL_EMAILS'; payload: Email[] }
+  | { type: 'MERGE_REAL_EMAILS'; payload: Email[] }
   | { type: 'SET_THUNDERBIRD_DATA'; payload: any }
   | { type: 'TOGGLE_THUNDERBIRD_PANEL' }
   | { type: 'TOGGLE_ALARM_BOARD' }
@@ -96,7 +106,9 @@ type Action =
   | { type: 'TOGGLE_TROUBLESHOOT' }
   | { type: 'TOGGLE_SETTINGS' }
   | { type: 'TOGGLE_FOLDER_SYNCED'; payload: string }
-  | { type: 'SELECT_SUPPLIER'; payload: number | null } // Fixed type
+  | { type: 'SET_SYNCED_FOLDER_PATH'; payload: { syncKey: string; mboxPath: string } }
+  | { type: 'SELECT_SUPPLIER'; payload: number | null }
+  | { type: 'SET_SUPPLIERS'; payload: any[] }
   | { type: 'SELECT_RFQ'; payload: string | null }
   | { type: 'DISMISS_ALARM'; payload: string }
   | { type: 'RESOLVE_EXCEPTION'; payload: string }
@@ -104,18 +116,22 @@ type Action =
   | { type: 'SET_AI_MODE'; payload: 'off' | 'auto' | 'full' }
   | { type: 'OPEN_TROUBLESHOOT'; payload: { level: number; targetId: string } }
   | { type: 'TOGGLE_HIDDEN_ACCOUNT'; payload: string }
-  | { type: 'UPDATE_EMAIL_STEP'; payload: { emailId: number; newStep: number } }
-  | { type: 'SET_SUPPLIERS'; payload: Supplier[] }; // New action
+  | { type: 'UPDATE_NLP_RESULTS'; payload: Record<string, { supplier_name: string | null; part_numbers: string[]; step: number; confidence: number }> }
+  | { type: 'SET_NLP_STATS'; payload: { pending: number; processing: number; completed: number; failed: number } }
+  // ── NEW ──
+  | { type: 'SET_RFQ_NAME'; payload: { supplierId: number; name: string; source: 'ai' | 'manual' } };
 
 const initialState: AppState = {
   theme: 'dark', fontSize: 'medium', useRealData: false,
   emails: [], thunderbirdData: null,
   isThunderbirdPanelOpen: false, isAlarmBoardOpen: false,
   isExceptionQueueOpen: false, isTroubleshootOpen: false,
-  isSettingsOpen: false, syncedFolders: new Set(),
-  suppliers: [], selectedSupplierId: null, rfqs: [],
+  isSettingsOpen: false, syncedFolders: new Set(), syncedFolderPaths: {}, suppliers: [],
+  selectedSupplierId: null, rfqs: [],
   selectedRfqId: null, alarms: [], exceptions: [],
   troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null, hiddenAccounts: new Set(),
+  nlpStats: { pending: 0, processing: 0, completed: 0, failed: 0 },
+  rfqNames: {},
 };
 
 function appReducer(state: AppState, action: Action): AppState {
@@ -124,13 +140,26 @@ function appReducer(state: AppState, action: Action): AppState {
     case 'SET_FONT_SIZE': return { ...state, fontSize: action.payload };
     case 'TOGGLE_DATA_SOURCE': return { ...state, useRealData: !state.useRealData };
     case 'SET_REAL_EMAILS': return { ...state, emails: action.payload, useRealData: true };
+    case 'MERGE_REAL_EMAILS': {
+      const existingIds = new Set(state.emails.map(e => e.messageId));
+      const newEmails = action.payload.filter((e: Email) => !existingIds.has(e.messageId));
+      return { ...state, emails: [...state.emails, ...newEmails], useRealData: true };
+    }
     case 'SET_THUNDERBIRD_DATA': return { ...state, thunderbirdData: action.payload };
     case 'TOGGLE_THUNDERBIRD_PANEL': return { ...state, isThunderbirdPanelOpen: !state.isThunderbirdPanelOpen };
     case 'TOGGLE_ALARM_BOARD': return { ...state, isAlarmBoardOpen: !state.isAlarmBoardOpen };
     case 'TOGGLE_EXCEPTION_QUEUE': return { ...state, isExceptionQueueOpen: !state.isExceptionQueueOpen };
     case 'TOGGLE_TROUBLESHOOT': return { ...state, isTroubleshootOpen: !state.isTroubleshootOpen };
     case 'TOGGLE_SETTINGS': return { ...state, isSettingsOpen: !state.isSettingsOpen };
-    case 'TOGGLE_FOLDER_SYNCED': { const n = new Set(state.syncedFolders); if (n.has(action.payload)) n.delete(action.payload); else n.add(action.payload); return { ...state, syncedFolders: n }; }
+    case 'TOGGLE_FOLDER_SYNCED': {
+      const n = new Set(state.syncedFolders);
+      const paths = { ...state.syncedFolderPaths };
+      if (n.has(action.payload)) { n.delete(action.payload); delete paths[action.payload]; }
+      else { n.add(action.payload); }
+      return { ...state, syncedFolders: n, syncedFolderPaths: paths };
+    }
+    case 'SET_SYNCED_FOLDER_PATH':
+      return { ...state, syncedFolderPaths: { ...state.syncedFolderPaths, [action.payload.syncKey]: action.payload.mboxPath } };
     case 'SELECT_SUPPLIER': return { ...state, selectedSupplierId: action.payload };
     case 'SELECT_RFQ': return { ...state, selectedRfqId: action.payload };
     case 'DISMISS_ALARM': return { ...state, alarms: state.alarms.map(a => a.id === action.payload ? { ...a, dismissed: true } : a) };
@@ -138,14 +167,38 @@ function appReducer(state: AppState, action: Action): AppState {
     case 'ADD_CHAT_MESSAGE': return { ...state, troubleshootChat: [...state.troubleshootChat, action.payload] };
     case 'SET_AI_MODE': return { ...state, aiMode: action.payload };
     case 'OPEN_TROUBLESHOOT': return { ...state, isTroubleshootOpen: true, troubleshootTarget: action.payload };
-    case 'TOGGLE_HIDDEN_ACCOUNT': { const h = new Set(state.hiddenAccounts); if (h.has(action.payload)) h.delete(action.payload); else h.add(action.payload); return { ...state, hiddenAccounts: h }; }
-    case 'SET_SUPPLIERS': return { ...state, suppliers: action.payload }; // New reducer case
-    case 'UPDATE_EMAIL_STEP': {
-      const updatedEmails = state.emails.map(e => 
-        e.id === action.payload.emailId ? { ...e, stepAssigned: action.payload.newStep } : e
-      );
+    case 'TOGGLE_HIDDEN_ACCOUNT': {
+      const h = new Set(state.hiddenAccounts);
+      if (h.has(action.payload)) h.delete(action.payload); else h.add(action.payload);
+      return { ...state, hiddenAccounts: h };
+    }
+    case 'UPDATE_NLP_RESULTS': {
+      const results = action.payload;
+      const updatedEmails = state.emails.map(e => {
+        const result = results[e.messageId];
+        if (!result) return e;
+        return {
+          ...e,
+          extracted: { supplier: result.supplier_name || null, partNumbers: result.part_numbers || [] },
+          classification: { step: result.step || 0, confidence: result.confidence || 0 },
+          stepAssigned: result.step || e.stepAssigned,
+        };
+      });
       return { ...state, emails: updatedEmails };
-    }    
+    }
+    case 'SET_NLP_STATS': return { ...state, nlpStats: action.payload };
+    case 'SET_SUPPLIERS': return { ...state, suppliers: action.payload };
+    // ── NEW ──
+    case 'SET_RFQ_NAME': {
+      const key = `supplier-${action.payload.supplierId}`;
+      return {
+        ...state,
+        rfqNames: {
+          ...state.rfqNames,
+          [key]: { name: action.payload.name, source: action.payload.source },
+        },
+      };
+    }
     default: return state;
   }
 }
@@ -154,7 +207,7 @@ interface AppContextType {
   state: AppState;
   dispatch: React.Dispatch<Action>;
   getFilteredEmails: () => Email[];
-  getSupplierKpis: (id: number) => any;
+  getSupplierKpis: (id: string) => any;
   getFilteredRfqs: () => Rfq[];
   getSelectedRfqParts: () => any[];
   getSelectedRfqAlarms: () => Alarm[];
@@ -165,49 +218,232 @@ const AppContext = createContext<AppContextType | null>(null);
 function getSavedSettings(): Partial<AppState> {
   try {
     const s = localStorage.getItem('rfq-settings');
-    if (s) { const p = JSON.parse(s); return { theme: p.theme || 'dark', fontSize: p.fontSize || 'medium', syncedFolders: new Set(p.syncedFolders || []), hiddenAccounts: new Set(p.hiddenAccounts || []) }; }
+    if (s) {
+      const p = JSON.parse(s);
+      return {
+        theme: p.theme || 'dark',
+        fontSize: p.fontSize || 'medium',
+        syncedFolders: new Set(p.syncedFolders || []),
+        syncedFolderPaths: p.syncedFolderPaths || {},
+        hiddenAccounts: new Set(p.hiddenAccounts || []),
+        rfqNames: p.rfqNames || {},
+      };
+    }
   } catch (e) {}
   return {};
 }
 
 function saveSettings(state: AppState) {
-  try { localStorage.setItem('rfq-settings', JSON.stringify({ theme: state.theme, fontSize: state.fontSize, syncedFolders: Array.from(state.syncedFolders), hiddenAccounts: Array.from(state.hiddenAccounts) })); } catch (e) {}
+  try {
+    localStorage.setItem('rfq-settings', JSON.stringify({
+      theme: state.theme,
+      fontSize: state.fontSize,
+      syncedFolders: Array.from(state.syncedFolders),
+      syncedFolderPaths: state.syncedFolderPaths,
+      hiddenAccounts: Array.from(state.hiddenAccounts),
+      rfqNames: state.rfqNames,   // ← persist AI/manual names across sessions
+    }));
+  } catch (e) {}
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(appReducer, initialState, (init) => ({ ...init, ...getSavedSettings() }));
 
-  useEffect(() => { saveSettings(state); }, [state.theme, state.fontSize, state.syncedFolders, state.hiddenAccounts]);
+  // Track which supplier IDs we've already requested a name for (avoids duplicate calls)
+  const nameRequestedRef = useRef<Set<number>>(new Set());
 
-  // ── NEW: Fetch suppliers from Python backend on startup ──
   useEffect(() => {
-    fetch('http://127.0.0.1:8721/db/suppliers')
-      .then(res => res.json())
-      .then(data => {
-        if (data.success && data.suppliers) {
-          dispatch({ type: 'SET_SUPPLIERS', payload: data.suppliers });
+    saveSettings(state);
+  }, [state.theme, state.fontSize, state.syncedFolders, state.syncedFolderPaths, state.hiddenAccounts, state.rfqNames]);
+
+  // ── NEW: Trigger AI name generation when first sent email per supplier arrives ──
+  useEffect(() => {
+    if (state.emails.length === 0) return;
+
+    // Find all sent emails, grouped by supplierId
+    const sentBySupplier = new Map<number, Email>();
+    for (const email of state.emails) {
+      if (!email.isSentByUser) continue;
+      const sid = email.supplierId || 0;
+      if (sid === 0) continue;
+      // Keep earliest sent email (most likely the original RFQ outreach)
+      const existing = sentBySupplier.get(sid);
+      if (!existing || email.sentAt < existing.sentAt) {
+        sentBySupplier.set(sid, email);
+      }
+    }
+
+    for (const [supplierId, sentEmail] of sentBySupplier) {
+      const key = `supplier-${supplierId}`;
+
+      // Skip if we already have an AI or manual name for this supplier
+      if (state.rfqNames[key]) continue;
+
+      // Skip if we already fired a request this session
+      if (nameRequestedRef.current.has(supplierId)) continue;
+      nameRequestedRef.current.add(supplierId);
+
+      // Find supplier display name
+      const supplier = state.suppliers.find((s: any) => s.id === supplierId);
+      const supplierName = supplier?.name || sentEmail.supplierName || `Supplier #${supplierId}`;
+
+      // Fire and forget — result dispatched when it arrives
+      (async () => {
+        try {
+          const res = await fetch('http://127.0.0.1:8721/rfq/generate-name', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              supplier_name: supplierName,
+              subject: sentEmail.subject || '',
+              body_text: sentEmail.body || '',
+              supplier_id: supplierId,
+            }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const result = await res.json();
+
+          if (result?.rfq_name) {
+            dispatch({
+              type: 'SET_RFQ_NAME',
+              payload: { supplierId, name: result.rfq_name, source: result.source === 'ai' ? 'ai' : 'ai' },
+            });
+          }
+        } catch (err) {
+          console.warn(`[RFQ-NAME] Failed to generate name for supplier ${supplierId}:`, err);
         }
-      })
-      .catch(err => console.error('[AppContext] Failed to fetch suppliers:', err));
+      })();
+    }
+  }, [state.emails, state.suppliers]);
+  // Note: intentionally excludes state.rfqNames from deps to avoid re-running after we set names
+
+  useEffect(() => {
+    const api = (window as any).electronAPI;
+    if (!api) return;
+
+    if (api.nlp) {
+      api.nlp.onResults((results: any) => { dispatch({ type: 'UPDATE_NLP_RESULTS', payload: results }); });
+      api.nlp.onStats((stats: any) => { dispatch({ type: 'SET_NLP_STATS', payload: stats }); });
+    }
+
+    if (api.thunderbird?.onAutoSync) {
+      api.thunderbird.onAutoSync((data: any) => {
+        if (data.profiles) dispatch({ type: 'SET_THUNDERBIRD_DATA', payload: { profiles: data.profiles } });
+        if (data.missingFolders?.length > 0) {
+          for (const syncKey of data.missingFolders) dispatch({ type: 'TOGGLE_FOLDER_SYNCED', payload: syncKey });
+        }
+      });
+    }
+
+    if (api.thunderbird?.onFolderUpdate) {
+      api.thunderbird.onFolderUpdate((data: any) => {
+        if (data.emails?.length > 0) dispatch({ type: 'MERGE_REAL_EMAILS', payload: data.emails });
+      });
+    }
+
+    const fetchSuppliers = async () => {
+      if (api.suppliers?.list) {
+        try {
+          const result = await api.suppliers.list();
+          if (result.suppliers) dispatch({ type: 'SET_SUPPLIERS', payload: result.suppliers });
+        } catch (e) {}
+      }
+    };
+    fetchSuppliers();
+    const si = setInterval(fetchSuppliers, 30000);
+    return () => { clearInterval(si); };
   }, []);
 
-  // ── FIXED: Memoized RFQ derivation from emails ──
-  const getFilteredEmails = () => state.emails;
-  
-  // ── FIXED: Actually compute KPIs from derived RFQs ──
-  const getSupplierKpis = (id: number) => {
-    const rfqs = filteredRfqs.filter(r => r.supplierId === id);
-    const openRfqs = rfqs.filter(r => r.status === 'Open' || r.status === 'Pending').length;
-    return {
-      openRfqs,
-      avgResponseDays: 0, 
-      quoteSuccessRate: 0, 
-      pendingAlarms: rfqs.reduce((sum, r) => sum + r.alarmCount, 0),
-      lastActivity: 'N/A', 
-    };
+  const getFilteredEmails = () => {
+    let emails = state.emails;
+    if (state.selectedSupplierId !== null) {
+      emails = emails.filter(e => e.supplierId === state.selectedSupplierId);
+    }
+    return emails;
   };
 
-  const getFilteredRfqs = () => filteredRfqs;
+  const getSupplierKpis = (_id: string) => ({});
+
+  const getFilteredRfqs = (): Rfq[] => {
+    if (state.emails.length === 0) return [];
+
+    const bySupplier = new Map<number, Email[]>();
+    for (const e of state.emails) {
+      const sid = e.supplierId || 0;
+      if (!bySupplier.has(sid)) bySupplier.set(sid, []);
+      bySupplier.get(sid)!.push(e);
+    }
+
+    const rfqs: Rfq[] = [];
+    for (const [supplierId, emails] of bySupplier) {
+      if (supplierId === 0) continue;
+
+      const rfqKey = `supplier-${supplierId}`;
+      const storedName = state.rfqNames[rfqKey];
+
+      const supplier = state.suppliers.find((s: any) => s.id === supplierId);
+      const supplierName = supplier?.name || emails[0]?.supplierName || `Supplier #${supplierId}`;
+
+      const maxStep = Math.max(...emails.map(e => e.stepAssigned || 0));
+      const latestDate = emails.reduce((latest, e) => {
+        const d = e.sentAt || '';
+        return d > latest ? d : latest;
+      }, '');
+      const alarmCount = emails.filter(e => e.hasConflict || e.isLowConfidence).length;
+      const enrichedCount = emails.filter(e => e.classification && e.classification.confidence > 0).length;
+
+      const partSet = new Set<string>();
+      for (const e of emails) {
+        if (e.extracted?.partNumbers) {
+          for (const p of e.extracted.partNumbers) partSet.add(p);
+        }
+      }
+
+      // ── Name resolution priority: manual > ai > rule fallback ──
+      let rfqName: string;
+      let rfqNameSource: 'auto' | 'ai' | 'manual';
+
+      if (storedName) {
+        rfqName = storedName.name;
+        rfqNameSource = storedName.source;
+      } else {
+        // Rule-based fallback (same as before, shown while AI call is in-flight)
+        if (partSet.size > 0) {
+          rfqName = `${supplierName} — ${Array.from(partSet).slice(0, 2).join(', ')}`;
+        } else {
+          const subj = emails[0]?.subject || '';
+          rfqName = subj && subj !== '(no subject)'
+            ? `${supplierName} — ${subj.substring(0, 40)}`
+            : supplierName;
+        }
+        rfqNameSource = 'auto';
+      }
+
+      rfqs.push({
+        id: rfqKey,
+        supplierId,
+        rfqName,
+        rfqNameSource,
+        ciNumber: null,
+        status: statusFromStep(maxStep),
+        currentStep: maxStep,
+        alarmCount,
+        emailCount: emails.length,
+        enrichedCount,
+        timestamp: latestDate,
+        partNumbers: Array.from(partSet),
+      });
+    }
+
+    rfqs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+    if (state.selectedSupplierId !== null) {
+      return rfqs.filter(r => r.supplierId === state.selectedSupplierId);
+    }
+
+    return rfqs;
+  };
+
   const getSelectedRfqParts = () => [];
   const getSelectedRfqAlarms = () => state.alarms;
 
@@ -216,10 +452,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
       {children}
     </AppContext.Provider>
   );
-} // <--- THIS BRACE CLOSES AppProvider
+}
 
 export function useApp() {
   const ctx = useContext(AppContext);
   if (!ctx) throw new Error('useApp must be inside AppProvider');
   return ctx;
-} 
+}

@@ -1,22 +1,14 @@
+// @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import type { Email } from '@/context/AppContext';
+import type { Email } from '@/types';
 import { EmailCard } from './EmailCard';
+import { workflowSteps } from '@/lib/mockData';
 import { useState, useCallback } from 'react';
-
-// Define workflow steps inline to avoid import issues
-const workflowSteps = [
-  { id: 1, stepName: 'Purchase Request' },
-  { id: 2, stepName: 'RFQ Sent' },
-  { id: 3, stepName: 'RFQ Received' },
-  { id: 4, stepName: 'Negotiation' },
-  { id: 5, stepName: 'CI / Invoice' },
-  { id: 6, stepName: 'CI Approved' },
-  { id: 7, stepName: 'Timeline' },
-];
 
 export function KanbanBoard() {
   const { state, dispatch, getFilteredEmails } = useApp();
-  const filteredEmails = getFilteredEmails() || [];
+  const filteredEmails = getFilteredEmails();
+  const selectedSupplier = state.suppliers.find(s => s.id === state.selectedSupplierId);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -60,8 +52,24 @@ export function KanbanBoard() {
         <h2 className="text-h2 font-semibold" style={{ color: 'var(--text-primary)' }}>Kanban Board</h2>
         <span className="text-small ml-2" style={{ color: 'var(--text-secondary)' }}>
           {filteredEmails.length} emails
-          {state.selectedSupplierId && ' (filtered)'}
         </span>
+        {state.selectedSupplierId && selectedSupplier && (
+          <span className="text-small ml-2 px-2 py-0.5 rounded-full" style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}>
+            {selectedSupplier.name}
+          </span>
+        )}
+        {state.selectedSupplierId && (
+          <button
+            onClick={() => {
+              dispatch({ type: 'SELECT_SUPPLIER', payload: null });
+              dispatch({ type: 'SELECT_RFQ', payload: null });
+            }}
+            className="ml-2 text-micro underline hover:no-underline"
+            style={{ color: 'var(--plum-accent)' }}
+          >
+            Clear filter
+          </button>
+        )}
       </div>
 
       <div className="flex-1 flex overflow-x-auto overflow-y-hidden custom-scrollbar px-2 pb-2 gap-2">
@@ -72,7 +80,7 @@ export function KanbanBoard() {
             style={{ backgroundColor: 'var(--column-bg)' }}
           >
             <div
-              className="flex items-center justify-between px-3 py-2"
+              className={`flex items-center justify-between px-3 py-2 column-header-gradient-${step.id}`}
               style={{
                 backgroundColor: 'var(--card-bg)',
                 borderBottom: '1px solid var(--border-color)',
@@ -120,55 +128,6 @@ export function KanbanBoard() {
               boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
             }}
           >
-            
-            {/* ── NEW: MOVE TO STEP OVERRIDE ── */}
-<div className="px-3 py-1 text-micro uppercase tracking-wider" style={{color: 'var(--text-tertiary)'}}>
-  Move to Step
-</div>
-{[
-  { id: 0, name: '0: New / Inbox' },
-  { id: 1, name: '1: RFQ Sent' },
-  { id: 2, name: '2: Offer Received' },
-  { id: 3, name: '3: PI Issued' },
-  { id: 4, name: '4: Payment Sent' },
-  { id: 5, name: '5: Delivery / Closed' },
-].map(step => (
-  <button
-    key={step.id}
-    className="w-full text-left px-3 py-1.5 text-body transition-colors hover:bg-[var(--brand-plum)] hover:text-white"
-    style={{
-      color: 'var(--text-secondary)',
-      backgroundColor: contextMenu.email?.stepAssigned === step.id ? 'rgba(107,61,139,0.2)' : 'transparent'
-    }}
-    onClick={async () => {
-      if (!contextMenu.email) return;
-      const emailId = contextMenu.email.id;
-
-      // 1. Update local state instantly for snappy UI
-      dispatch({ type: 'UPDATE_EMAIL_STEP', payload: { emailId, newStep: step.id } });
-
-      // 2. Save to Python backend
-      try {
-        await fetch(`http://127.0.0.1:8721/db/emails/${emailId}/step`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ step: step.id }),
-        });
-      } catch (err) {
-        console.error('Failed to update step:', err);
-      }
-
-      setContextMenu(null); // Close the menu
-    }}
-  >
-    {step.name}
-  </button>
-))}
-
-{/* Divider line */}
-<div className="my-1 border-t" style={{ borderColor: 'var(--border-color)' }}></div>
-{/* ── END MOVE TO STEP ── */}
-
             <div className="px-3 py-1 text-micro uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
               Email Level 1
             </div>

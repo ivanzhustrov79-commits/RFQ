@@ -1,6 +1,6 @@
 /**
  * Safe date formatting utilities.
- * Wraps date-fns with try/catch to prevent "Invalid time value" crashes.
+ * These wrap date-fns with try/catch to prevent "Invalid time value" crashes.
  */
 import { format, parseISO, isValid } from 'date-fns';
 

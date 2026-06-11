@@ -16,8 +16,8 @@ from database import (
     queue_emails_for_nlp, get_next_nlp_pending, mark_nlp_processing,
     save_nlp_result, mark_nlp_failed, get_nlp_results, get_nlp_queue_stats,
     run_migration_002, run_migration_003,
+    reset_stuck_processing,
     get_or_create_supplier_by_folder, list_suppliers_with_stats,
-    update_email_step, # <--- ADD THIS LINE
 )
 from models import (
     HealthResponse, MboxParseRequest, MboxParseResponse,
@@ -47,7 +47,9 @@ async def lifespan(app: FastAPI):
     await init_db()
     await run_migration_002()
     await run_migration_003()
+    await reset_stuck_processing()   # recover any rows stuck from previous crash
     _start_time = time.time()
+
     logger.info("Service ready on %s:%d", HOST, PORT)
     # Start background NLP worker
     asyncio.create_task(_nlp_background_worker())
@@ -80,6 +82,19 @@ async def log_requests(request, call_next):
     duration = (time.time() - start) * 1000
     logger.debug("%s %s -> %d (%.1fms)", request.method, request.url.path, response.status_code, duration)
     return response
+
+
+# ─────────────────────────────────────────────────────────────
+# 1.  NEW MODEL  (add near the other model imports at the top,
+#     or just inline here — FastAPI doesn't care where it lives)
+# ─────────────────────────────────────────────────────────────
+from pydantic import BaseModel
+
+class RfqNameRequest(BaseModel):
+    supplier_name: str          # e.g. "Camso"
+    subject: str                # latest sent email subject
+    body_text: str = ""         # sent email body (first 800 chars used)
+    supplier_id: int            # for logging / future caching
 
 
 # ── Phase 1: Health ──
@@ -454,16 +469,72 @@ async def db_list_suppliers():
     suppliers = await list_suppliers_with_stats()
     return {"suppliers": suppliers, "count": len(suppliers)}
 
-# ── Step Override API ──
-@app.patch("/db/emails/{email_id}/step")
-async def db_update_email_step(email_id: int, request: dict):
-    """Update the workflow step for an email (Manual Step Override)."""
-    new_step = request.get("step")
-    if new_step is None or not isinstance(new_step, int) or new_step < 0 or new_step > 6:
-        raise HTTPException(status_code=400, detail="Invalid step (must be 0-6)")
+# ─────────────────────────────────────────────────────────────
+# 2.  NEW ROUTE  (paste after /db/suppliers, before # ── Run ──)
+# ─────────────────────────────────────────────────────────────
+@app.post("/rfq/generate-name")
+async def rfq_generate_name(request: RfqNameRequest):
+    """
+    Ask Ollama to generate a short human-readable RFQ name.
+    Format:  <Supplier> — <product summary>
+    e.g.    "Camso — track assembly x4"
 
-    result = await update_email_step(email_id, new_step)
-    return result
+    Called by Electron main.cjs via callPython() when the first
+    outbound (isSentByUser=true) email for a supplier is detected.
+
+    Returns:
+        { "rfq_name": "Camso — track assembly x4", "source": "ai" }
+    Falls back to rule-based name if Ollama is unavailable.
+    """
+    from ai.ollama_client import generate_json, is_available
+
+    supplier = request.supplier_name.strip() or f"Supplier #{request.supplier_id}"
+
+    # ── Fallback: build a name without LLM ──
+    def _fallback_name() -> dict:
+        subj = request.subject.strip()
+        # Strip common noise prefixes (Re:, Fwd:, FW:, AW:, etc.)
+        import re
+        subj = re.sub(r'^(re|fwd?|aw|sv)[\s:]+', '', subj, flags=re.IGNORECASE).strip()
+        name = f"{supplier} — {subj[:45]}" if subj else supplier
+        return {"rfq_name": name, "source": "rule"}
+
+    if not is_available():
+        logger.info("[RFQ-NAME] Ollama unavailable, using rule fallback for supplier %d", request.supplier_id)
+        return _fallback_name()
+
+    # Truncate body to keep prompt fast
+    body_snippet = request.body_text[:800].strip()
+    subject_clean = request.subject.strip()
+
+    prompt = f"""You are a procurement assistant. Your job is to create a short, descriptive RFQ name.
+
+Supplier: {supplier}
+Email subject: {subject_clean}
+Email body excerpt:
+{body_snippet}
+
+Rules:
+- Format MUST be: "<Supplier> — <product summary>"
+- Product summary: 2–6 words, focus on product type and key spec (quantity, size, model)
+- Examples: "Camso — track assembly x4", "Parker — hydraulic valve DN50 x2", "SKF — bearing 6205 x100"
+- Do NOT include dates, RFQ numbers, or email metadata
+- Respond ONLY with JSON: {{"rfq_name": "..."}}
+"""
+
+    result = generate_json(prompt, temperature=0.15)
+
+    if result and isinstance(result.get("rfq_name"), str) and len(result["rfq_name"]) > 3:
+        name = result["rfq_name"].strip()
+        # Safety: ensure supplier name is present (LLM sometimes drops it)
+        if supplier.lower() not in name.lower():
+            name = f"{supplier} — {name}"
+        logger.info("[RFQ-NAME] AI name for supplier %d: %s", request.supplier_id, name)
+        return {"rfq_name": name, "source": "ai"}
+
+    logger.warning("[RFQ-NAME] AI returned bad result for supplier %d, using fallback", request.supplier_id)
+    return _fallback_name()
+
 
 # ── Run ──
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { useApp } from '@/context/AppContext';
 import { Cpu, Mail } from 'lucide-react';
 
@@ -16,40 +17,47 @@ export function SupplierPane() {
   const { state, dispatch } = useApp();
 
   const handleSelect = (id: number) => {
-    dispatch({ type: 'SELECT_SUPPLIER', payload: state.selectedSupplierId === id ? null : id });
+    const isAlreadySelected = state.selectedSupplierId === id;
+    if (isAlreadySelected) {
+      // Deselect — clear both supplier and RFQ filter
+      dispatch({ type: 'SELECT_SUPPLIER', payload: null });
+      dispatch({ type: 'SELECT_RFQ', payload: null });
+    } else {
+      // Select new supplier — clear RFQ selection to avoid stale state
+      dispatch({ type: 'SELECT_SUPPLIER', payload: id });
+      dispatch({ type: 'SELECT_RFQ', payload: null });
+    }
   };
-
-  const suppliers = state.suppliers || [];
 
   return (
     <div className="w-[220px] shrink-0 flex flex-col overflow-hidden" style={{ backgroundColor: 'var(--deep-plum-bg)' }}>
       <div className="px-4 py-3 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-color)' }}>
         <h2 className="text-h1 font-semibold" style={{ color: 'var(--text-primary)' }}>Suppliers</h2>
         <span className="text-micro font-semibold px-1.5 py-0.5 rounded-full" style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}>
-          {suppliers.length}
+          {state.suppliers.length}
         </span>
       </div>
 
       <div className="px-4 py-2 flex items-center justify-between" style={{ borderBottom: '1px solid var(--border-color)', backgroundColor: 'rgba(107,61,139,0.1)' }}>
         <div className="flex flex-col">
           <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>RFQs</span>
-          <span className="text-h2 font-bold" style={{ color: 'var(--text-primary)' }}>{suppliers.length}</span>
+          <span className="text-h2 font-bold" style={{ color: 'var(--text-primary)' }}>{state.suppliers.length}</span>
         </div>
         <div className="flex flex-col items-end">
           <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>Emails</span>
-          <span className="text-h2 font-bold" style={{ color: 'var(--text-primary)' }}>{(state.emails || []).length}</span>
+          <span className="text-h2 font-bold" style={{ color: 'var(--text-primary)' }}>{state.emails.length}</span>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto custom-scrollbar">
-        {suppliers.length === 0 ? (
+        {state.suppliers.length === 0 ? (
           <div className="px-4 py-8 text-center">
             <Cpu className="w-8 h-8 mx-auto mb-2" style={{ color: 'var(--text-tertiary)', opacity: 0.5 }} />
             <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>No suppliers yet</span>
             <p className="text-micro mt-1" style={{ color: 'var(--text-tertiary)', opacity: 0.6 }}>Sync a folder to create suppliers</p>
           </div>
         ) : (
-          suppliers.map((supplier: any) => {
+          state.suppliers.map((supplier: any) => {
             const isSelected = state.selectedSupplierId === supplier.id;
             return (
               <button

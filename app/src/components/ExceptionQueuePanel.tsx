@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { X, AlertTriangle, Wand2, CheckSquare, Square, Check } from 'lucide-react';
 import { format, isValid } from 'date-fns';
 
@@ -16,21 +16,13 @@ function safeFormat(dateValue: string | Date | null | undefined, fmt: string = '
 }
 
 export function ExceptionQueuePanel() {
-const [isVisible, setIsVisible] = useState(false);
+  const { state, dispatch } = useApp();
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [visible, setVisible] = useState(false);
 
-// ✅ FIXED: Moved setTimeout into useEffect
-useEffect(() => {
-  if (state.isExceptionQueueOpen && !isVisible) {
-    const timer = setTimeout(() => setIsVisible(true), 10);
-    return () => clearTimeout(timer);
-  }
-  if (!state.isExceptionQueueOpen && isVisible) {
-    const timer = setTimeout(() => setIsVisible(false), 0);
-    return () => clearTimeout(timer);
-  }
-}, [state.isExceptionQueueOpen, isVisible]);
-
-if (!state.isExceptionQueueOpen && !isVisible) return null;
+  if (state.isExceptionQueueOpen && !visible) setTimeout(() => setVisible(true), 10);
+  if (!state.isExceptionQueueOpen && visible) setTimeout(() => setVisible(false), 0);
+  if (!state.isExceptionQueueOpen && !visible) return null;
 
   const handleClose = () => { setVisible(false); setTimeout(() => dispatch({ type: 'TOGGLE_EXCEPTION_QUEUE' }), 250); };
 

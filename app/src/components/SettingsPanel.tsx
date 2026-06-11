@@ -1,24 +1,15 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { X, Cpu, Globe, Database, Shield, Key, Sun, Moon } from 'lucide-react';
 
 export function SettingsPanel() {
-const [isVisible, setIsVisible] = useState(false);
+  const { state, dispatch } = useApp();
+  const [visible, setVisible] = useState(false);
 
-// ✅ FIXED: Moved setTimeout into useEffect
-useEffect(() => {
-  if (state.isSettingsOpen && !isVisible) {
-    const timer = setTimeout(() => setIsVisible(true), 10);
-    return () => clearTimeout(timer);
-  }
-  if (!state.isSettingsOpen && isVisible) {
-    const timer = setTimeout(() => setIsVisible(false), 0);
-    return () => clearTimeout(timer);
-  }
-}, [state.isSettingsOpen, isVisible]);
-
-if (!state.isSettingsOpen && !isVisible) return null;
+  if (state.isSettingsOpen && !visible) setTimeout(() => setVisible(true), 10);
+  if (!state.isSettingsOpen && visible) setTimeout(() => setVisible(false), 0);
+  if (!state.isSettingsOpen && !visible) return null;
 
   const handleClose = () => { setVisible(false); setTimeout(() => dispatch({ type: 'TOGGLE_SETTINGS' }), 200); };
 

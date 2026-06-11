@@ -29,36 +29,49 @@ export class ErrorBoundary extends Component<Props, State> {
     window.location.reload();
   };
 
+  handleRetry = () => {
+    this.setState({ hasError: false, error: null });
+  };
+
   render() {
     if (this.state.hasError) {
       return (
         <div
-          className="h-screen w-screen flex flex-col items-center justify-center p-8"
-          style={{ backgroundColor: '#130A1B', color: '#B8A5C5' }}
+          className="flex flex-col items-center justify-center p-8 gap-3"
+          style={{ backgroundColor: '#130A1B', color: '#B8A5C5', minHeight: '300px' }}
         >
-          <AlertCircle className="w-12 h-12 mb-4" style={{ color: '#E74C3C' }} />
-          <h2 className="text-h1 font-bold mb-2" style={{ color: '#FFFFFF' }}>
+          <AlertCircle className="w-10 h-10" style={{ color: '#E74C3C' }} />
+          <h2 className="text-h2 font-bold" style={{ color: '#FFFFFF' }}>
             Something went wrong
           </h2>
-          <p className="text-body mb-2 text-center max-w-md">
-            The app encountered an error. This is a safety net to prevent the black screen.
+          <p className="text-small text-center max-w-md" style={{ color: '#8A7D99' }}>
+            A rendering error occurred. Try reloading or retrying.
           </p>
           <div
-            className="p-3 rounded-md mb-4 max-w-lg w-full overflow-auto"
+            className="p-2 rounded-md max-w-lg w-full overflow-auto"
             style={{ backgroundColor: '#1D1127', border: '1px solid #2D1F3F' }}
           >
             <code className="text-micro" style={{ color: '#E74C3C' }}>
               {this.state.error}
             </code>
           </div>
-          <button
-            onClick={this.handleReload}
-            className="flex items-center gap-2 px-4 py-2 rounded-md text-small font-medium"
-            style={{ backgroundColor: '#6B3D8B', color: 'white' }}
-          >
-            <RefreshCw className="w-4 h-4" />
-            Reload App
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={this.handleRetry}
+              className="flex items-center gap-2 px-4 py-2 rounded-md text-small font-medium"
+              style={{ backgroundColor: '#2D1F3F', color: '#B8A5C5', border: '1px solid #4A3569' }}
+            >
+              <RefreshCw className="w-4 h-4" />
+              Retry
+            </button>
+            <button
+              onClick={this.handleReload}
+              className="flex items-center gap-2 px-4 py-2 rounded-md text-small font-medium"
+              style={{ backgroundColor: '#6B3D8B', color: 'white' }}
+            >
+              Reload App
+            </button>
+          </div>
         </div>
       );
     }

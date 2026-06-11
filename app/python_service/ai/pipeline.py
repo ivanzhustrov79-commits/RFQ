@@ -103,16 +103,22 @@ def classify_step_llm(subject: str, body_text: str,
         for i, prev in enumerate(previous_emails[-3:]):
             prev_context += f"\nPrevious email {i+1}: step {prev.get('step', '?')} - {prev.get('subject', 'N/A')}"
 
-    prompt = f"""You are an RFQ workflow classifier. Classify this email into one of 7 steps.
+    prompt = f"""You are an RFQ workflow classifier for a procurement system. Classify this email into exactly one of these 6 steps.
 
 Workflow Steps:
-1. RFQ Sent - Outgoing request for quote
-2. Quote Received - Incoming price quotation from supplier
-3. PI Received - Proforma invoice received
-4. CI Issued - Commercial invoice/shipping documents
-5. Customs - Customs clearance/declaration
-6. Delivered - Goods received at warehouse
-7. Closed - Order completed
+0. New / Inbox       - Unprocessed or unrelated email, no clear procurement action
+1. RFQ Sent          - Outgoing request for quote sent TO a supplier
+2. Offer Received    - Incoming price quotation or offer FROM a supplier
+3. PI Issued         - Proforma Invoice issued or received
+4. Payment Sent      - Payment instruction, bank transfer confirmation, or payment acknowledgement
+5. Delivery / Closed - Shipping confirmation, delivery note, tracking info, or order closed
+
+Key signals:
+- Step 1: subject contains "RFQ", "inquiry", "request", "запрос" or email is outbound to supplier
+- Step 2: subject contains "offer", "quote", "price", "quotation", "предложение", "прайс", or email has price list attachment
+- Step 3: subject contains "PI", "proforma", "invoice", "счет", or attachment is a proforma document
+- Step 4: subject contains "payment", "transfer", "оплата", "перевод", or body mentions bank/SWIFT/wire
+- Step 5: subject contains "delivery", "shipped", "tracking", "AWB", "доставка", "отгрузка", or body mentions waybill/courier
 
 Email Subject: {subject}
 Has Attachments: {has_attachments}
@@ -123,10 +129,10 @@ Body:
 
 Return ONLY a JSON object:
 {{
-  "suggested_step": 1-7,
-  "step_name": "human readable name",
+  "suggested_step": 0-5,
+  "step_name": "human readable name from the list above",
   "confidence": 0.0 to 1.0,
-  "reason": "brief explanation",
+  "reason": "brief explanation referencing specific words found",
   "is_low_confidence": true/false,
   "has_conflict": true/false
 }}"""
@@ -135,17 +141,17 @@ Return ONLY a JSON object:
     if not result:
         return None
 
-    step = result.get("suggested_step", 1)
-    if not isinstance(step, int) or step < 1 or step > 7:
-        step = 1
+    step = result.get("suggested_step", 0)
+    if not isinstance(step, int) or step < 0 or step > 5:
+        step = 0
 
     return {
         "suggested_step": step,
         "step_name": result.get("step_name", f"Step {step}"),
-        "confidence": result.get("confidence", 0.5),
+        "confidence": float(result.get("confidence", 0.5)),
         "reason": result.get("reason", "LLM classification"),
         "alternative_steps": [],
-        "is_low_confidence": result.get("is_low_confidence", False),
+        "is_low_confidence": result.get("is_low_confidence", step == 0),
         "has_conflict": result.get("has_conflict", False),
     }
 

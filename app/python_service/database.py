@@ -297,24 +297,53 @@ async def upsert_supplier(data: Dict[str, Any]) -> Dict[str, Any]:
 
 # ── Background NLP Queue ──
 
+async def reset_stuck_processing() -> int:
+    """Reset any emails stuck in 'processing' state back to 'pending'.
+    Call this on service startup to recover from crashes/restarts."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE emails SET nlp_status = 'pending' WHERE nlp_status = 'processing'"
+    )
+    await db.commit()
+    count = db.total_changes
+    if count:
+        logger.info("[DB] Reset %d stuck 'processing' emails back to 'pending'", count)
+    return count
+
+
 async def queue_emails_for_nlp(message_ids: List[str]) -> int:
     """Mark emails as pending for background LLM enrichment.
-    Only queues emails that haven't been processed yet."""
+    Only queues emails that haven't been successfully completed yet."""
     db = await get_db()
-    # Use parameterized query with placeholders
     placeholders = ','.join('?' * len(message_ids))
     await db.execute(f"""
         UPDATE emails SET nlp_status = 'pending'
         WHERE message_id IN ({placeholders})
-        AND (nlp_status IS NULL OR nlp_status IN ('pending', 'failed'))
+        AND (nlp_status IS NULL OR nlp_status NOT IN ('completed'))
     """, message_ids)
     await db.commit()
-    return db.total_changes
+    # total_changes is on the connection, not returned by execute
+    cursor = await db.execute(
+        f"SELECT COUNT(*) as c FROM emails WHERE message_id IN ({placeholders}) AND nlp_status = 'pending'",
+        message_ids
+    )
+    row = await cursor.fetchone()
+    return row["c"] if row else 0
 
 
 async def get_next_nlp_pending() -> Optional[Dict[str, Any]]:
-    """Get the next email waiting for LLM enrichment."""
+    """Get the next email waiting for LLM enrichment.
+    Also auto-recovers rows stuck in 'processing' for more than 10 minutes."""
     db = await get_db()
+    # Recover any rows that got stuck in processing (worker crash/restart)
+    await db.execute("""
+        UPDATE emails SET nlp_status = 'pending'
+        WHERE nlp_status = 'processing'
+        AND nlp_enriched_at IS NULL
+        AND parsed_at < datetime('now', '-10 minutes')
+    """)
+    await db.commit()
+
     cursor = await db.execute("""
         SELECT id, message_id, subject, body_text, sender_email, body_language
         FROM emails
@@ -340,9 +369,9 @@ async def save_nlp_result(email_id: int, result: Dict[str, Any]) -> None:
     """Save LLM enrichment result and mark as completed."""
     import json
     db = await get_db()
-    # Update step_assigned if we got a valid step
-    step = result.get("step", 0)
-    if step and step >= 1:
+    step = result.get("step")
+    # Update step for any valid step value 0-5 (0 = New/Inbox is a valid assignment)
+    if step is not None and isinstance(step, int) and 0 <= step <= 5:
         await db.execute("""
             UPDATE emails SET
                 nlp_status = 'completed',
@@ -553,68 +582,3 @@ async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
     """)
     rows = await cursor.fetchall()
     return [dict(row) for row in rows]
-# ── Missing Functions Required by main.py ──
-
-async def get_or_create_supplier_by_folder(folder_name: str, email_domain: str, sender_email: str) -> Dict[str, Any]:
-    """Get or create supplier by folder name. Same folder name = same supplier."""
-    db = await get_db()
-    
-    # Try to find by name first (folder_name is used as supplier name)
-    cursor = await db.execute("SELECT id, name FROM suppliers WHERE name = ?", (folder_name,))
-    existing = await cursor.fetchone()
-    
-    if existing:
-        return {"supplier_id": existing["id"], "name": existing["name"], "action": "existing"}
-    
-    # If not found, create new supplier
-    # Use email_domain if available, otherwise generate a dummy one to satisfy UNIQUE constraint
-    domain = email_domain or f"{folder_name.lower().replace(' ', '_')}@unknown.local"
-    
-    cursor = await db.execute("""
-        INSERT INTO suppliers (name, email_domain, contact_email, default_currency)
-        VALUES (?, ?, ?, 'USD')
-    """, (folder_name, domain, sender_email or None))
-    await db.commit()
-    
-    return {"supplier_id": cursor.lastrowid, "name": folder_name, "action": "inserted"}
-
-async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
-    """List all suppliers with their email counts and open RFQ counts."""
-    db = await get_db()
-    
-    cursor = await db.execute("""
-        SELECT 
-            s.id,
-            s.name,
-            s.email_domain,
-            s.contact_email,
-            s.default_currency,
-            COUNT(e.id) as email_count,
-            SUM(CASE WHEN e.step_assigned < 4 THEN 1 ELSE 0 END) as open_rfq_count
-        FROM suppliers s
-        LEFT JOIN emails e ON s.id = e.supplier_id
-        GROUP BY s.id
-        ORDER BY s.name
-    """)
-    
-    rows = await cursor.fetchall()
-    suppliers = []
-    for row in rows:
-        suppliers.append({
-            "id": row["id"],
-            "name": row["name"],
-            "email_domain": row["email_domain"],
-            "contact_email": row["contact_email"],
-            "default_currency": row["default_currency"],
-            "email_count": row["email_count"] or 0,
-            "openRfqCount": row["open_rfq_count"] or 0,
-        })
-    
-    return suppliers
-
-async def update_email_step(email_id: int, new_step: int) -> Dict[str, Any]:
-    """Update the workflow step for a specific email (Step Override)."""
-    db = await get_db()
-    await db.execute("UPDATE emails SET step_assigned = ? WHERE id = ?", (new_step, email_id))
-    await db.commit()
-    return {"success": True, "email_id": email_id, "new_step": new_step}
