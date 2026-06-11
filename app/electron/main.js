@@ -89,45 +89,18 @@ async function queueEmailsForBackgroundNLP(emails) {
   }
 }
 
-// ── Supplier cache for folder→supplierId resolution ──
-let _suppliersCache = []; // refreshed on each sync cycle
-
-async function refreshSuppliersCache() {
-  if (!pythonAvailable) return;
-  try {
-    const result = await callPython('/db/suppliers', null, 'GET');
-    if (result?.suppliers) {
-      _suppliersCache = result.suppliers;
-    }
-  } catch (e) { /* keep existing cache */ }
-}
-
-function resolveSupplierIdByFolder(folderName) {
-  if (!folderName || _suppliersCache.length === 0) return null;
-  const normalized = folderName.trim().toUpperCase().replace(/-\d+$/, '');
-  const match = _suppliersCache.find(s =>
-    s.folder_name_normalized === normalized ||
-    s.name.toUpperCase() === normalized
-  );
-  return match ? match.id : null;
-}
-
 // ── Persist emails to SQLite via Python backend ──
+// Python auto-resolves supplier_id from sender email via supplier_contact_emails table.
 async function persistEmailsToDB(emails, syncKey) {
   if (!pythonAvailable || !emails || emails.length === 0) return;
 
-  const parts = syncKey ? syncKey.split('::') : [];
-  const accountEmail = parts[0] || 'unknown';
-  const folderPath = parts[1] || 'inbox';
-
-  // Extract folder name for supplier matching (last path segment)
-  const folderName = folderPath.split('/').pop() || folderPath;
+  const folderName = syncKey ? syncKey.split('/').pop() || 'inbox' : 'inbox';
+  const accountEmail = syncKey ? syncKey.split('/')[0] || 'unknown' : 'unknown';
 
   let stored = 0;
   let skipped = 0;
   let failed = 0;
 
-  // Process in small batches to avoid overwhelming the Python server
   const BATCH_SIZE = 5;
   for (let i = 0; i < emails.length; i += BATCH_SIZE) {
     const batch = emails.slice(i, i + BATCH_SIZE);
@@ -136,8 +109,6 @@ async function persistEmailsToDB(emails, syncKey) {
       try {
         const senderEmail = email.senderEmail || email.from || '';
         const domain = extractDomain(email.from || senderEmail);
-        // Resolve supplier from folder name using local cache
-        const supplierId = email.supplierId || resolveSupplierIdByFolder(folderName) || null;
         const emailId = email.id || (email.messageId
           ? parseInt(email.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000)
           : Math.floor(Math.random() * 1000000));
@@ -159,7 +130,7 @@ async function persistEmailsToDB(emails, syncKey) {
           thread_id: email.threadId || null,
           step_assigned: email.stepAssigned || 0,
           rfq_id: null,
-          supplier_id: supplierId,
+          supplier_id: null,  // Python resolves from sender_email automatically
         });
         stored++;
       } catch (e) {
@@ -951,9 +922,14 @@ function createWindow() {
 
 // ── Auto-Sync State ──
 let _syncedFolderPaths = {};    // syncKey -> mboxPath (received from renderer)
+let _syncFromDate = null;       // ISO date string filter e.g. "2025-01-01"
 let _autoSyncInterval = null;   // 5-minute timer
 let _isScanning = false;        // prevent overlapping scans
 
+ipcMain.handle('thunderbird:setSyncFromDate', (_event, date) => {
+  _syncFromDate = date || null;
+  console.log('[TB-SYNC] Sync-from date set to:', _syncFromDate || 'none');
+});
 // Receive synced folder paths from renderer (for health checks)
 ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
   const prev = Object.keys(_syncedFolderPaths).length;
@@ -968,6 +944,16 @@ ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
   }
 });
 
+ipcMain.handle('suppliers:list', async () => {
+  try {
+    const result = await callPython('/db/suppliers', null, 'GET');
+    return result;
+  } catch (err) {
+    console.log('[SUPPLIERS] Failed to fetch:', err.message);
+    return { suppliers: [] };
+  }
+});
+
 // Perform full Thunderbird sync + health check
 async function runThunderbirdSync() {
   if (_isScanning) {
@@ -979,7 +965,6 @@ async function runThunderbirdSync() {
 
   try {
     console.log('[TB-SYNC] Starting auto-sync...');
-    await refreshSuppliersCache(); // ensure supplier→folder mapping is fresh
     const result = findThunderbirdProfiles();
 
     if (result.error) {
@@ -1022,24 +1007,27 @@ async function runThunderbirdSync() {
         const content = fs.readFileSync(mboxPath, 'utf8');
         const emails = parseMboxEmails(content, 10000);
         if (emails.length > 0) {
-          // Resolve supplierId for all emails in this folder
-          const supplierId = resolveSupplierIdByFolder(folderName);
-          if (supplierId) {
-            for (const e of emails) e.supplierId = supplierId;
-          }
-          // Persist to SQLite first (so NLP worker has body_text)
+          // Apply sync-from date filter for UI display (DB still gets all emails for NLP)
+          const displayEmails = _syncFromDate
+            ? emails.filter(e => {
+                if (!e.sentAt) return true;
+                return new Date(e.sentAt) >= new Date(_syncFromDate);
+              })
+            : emails;
+
+          // Persist ALL emails to SQLite (NLP processes everything)
           if (pythonAvailable) {
             persistEmailsToDB(emails, syncKey).catch(() => {});
           }
-          // Queue for NLP
+          // Queue ALL for NLP
           if (pythonAvailable) {
             queueEmailsForBackgroundNLP(emails).catch(() => {});
           }
-          // Send to renderer for live update
+          // Send date-filtered emails to renderer for UI display
           mainWindow.webContents.send('thunderbird:folderUpdate', {
             syncKey,
-            emails,
-            total: emails.length,
+            emails: displayEmails,
+            total: displayEmails.length,
           });
         }
       } catch (err) {

@@ -77,6 +77,8 @@ interface AppState {
   isSettingsOpen: boolean;
   syncedFolders: Set<string>;
   syncedFolderPaths: Record<string, string>;
+  supplierSyncEnabled: Record<number, boolean>; // supplierId → true/false
+  syncFromDate: string | null; // ISO date string e.g. "2025-01-01"
   selectedSupplierId: number | null;
   suppliers: any[];
   rfqs: Rfq[];
@@ -107,6 +109,8 @@ type Action =
   | { type: 'TOGGLE_SETTINGS' }
   | { type: 'TOGGLE_FOLDER_SYNCED'; payload: string }
   | { type: 'SET_SYNCED_FOLDER_PATH'; payload: { syncKey: string; mboxPath: string } }
+  | { type: 'SET_SUPPLIER_SYNC'; payload: { supplierId: number; enabled: boolean } }
+  | { type: 'SET_SYNC_FROM_DATE'; payload: string | null }
   | { type: 'SELECT_SUPPLIER'; payload: number | null }
   | { type: 'SET_SUPPLIERS'; payload: any[] }
   | { type: 'SELECT_RFQ'; payload: string | null }
@@ -127,7 +131,8 @@ const initialState: AppState = {
   emails: [], thunderbirdData: null,
   isThunderbirdPanelOpen: false, isAlarmBoardOpen: false,
   isExceptionQueueOpen: false, isTroubleshootOpen: false,
-  isSettingsOpen: false, syncedFolders: new Set(), syncedFolderPaths: {}, suppliers: [],
+  isSettingsOpen: false, syncedFolders: new Set(), syncedFolderPaths: {},
+  supplierSyncEnabled: {}, syncFromDate: null, suppliers: [],
   selectedSupplierId: null, rfqs: [],
   selectedRfqId: null, alarms: [], exceptions: [],
   troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null, hiddenAccounts: new Set(),
@@ -161,6 +166,10 @@ function appReducer(state: AppState, action: Action): AppState {
     }
     case 'SET_SYNCED_FOLDER_PATH':
       return { ...state, syncedFolderPaths: { ...state.syncedFolderPaths, [action.payload.syncKey]: action.payload.mboxPath } };
+    case 'SET_SUPPLIER_SYNC':
+      return { ...state, supplierSyncEnabled: { ...state.supplierSyncEnabled, [action.payload.supplierId]: action.payload.enabled } };
+    case 'SET_SYNC_FROM_DATE':
+      return { ...state, syncFromDate: action.payload };
     case 'SELECT_SUPPLIER': return { ...state, selectedSupplierId: action.payload };
     case 'SELECT_RFQ': return { ...state, selectedRfqId: action.payload };
     case 'DISMISS_ALARM': return { ...state, alarms: state.alarms.map(a => a.id === action.payload ? { ...a, dismissed: true } : a) };
@@ -239,6 +248,8 @@ function getSavedSettings(): Partial<AppState> {
         syncedFolderPaths: p.syncedFolderPaths || {},
         hiddenAccounts: new Set(p.hiddenAccounts || []),
         rfqNames: p.rfqNames || {},
+        supplierSyncEnabled: p.supplierSyncEnabled || {},
+        syncFromDate: p.syncFromDate || null,
       };
     }
   } catch (e) {}
@@ -253,7 +264,9 @@ function saveSettings(state: AppState) {
       syncedFolders: Array.from(state.syncedFolders),
       syncedFolderPaths: state.syncedFolderPaths,
       hiddenAccounts: Array.from(state.hiddenAccounts),
-      rfqNames: state.rfqNames,   // ← persist AI/manual names across sessions
+      rfqNames: state.rfqNames,
+      supplierSyncEnabled: state.supplierSyncEnabled,
+      syncFromDate: state.syncFromDate,   // ← persist AI/manual names across sessions
     }));
   } catch (e) {}
 }
@@ -265,8 +278,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const nameRequestedRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
-    saveSettings(state);
-  }, [state.theme, state.fontSize, state.syncedFolders, state.syncedFolderPaths, state.hiddenAccounts, state.rfqNames]);
+    const api = (window as any).electronAPI;
+    if (api?.thunderbird?.setSyncFromDate) {
+      api.thunderbird.setSyncFromDate(state.syncFromDate);
+    }
+  }, [state.syncFromDate]);
 
   // ── NEW: Trigger AI name generation when first sent email per supplier arrives ──
   useEffect(() => {
@@ -349,7 +365,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     if (api.thunderbird?.onFolderUpdate) {
       api.thunderbird.onFolderUpdate((data: any) => {
-        if (data.emails?.length > 0) dispatch({ type: 'MERGE_REAL_EMAILS', payload: data.emails });
+        if (data.emails?.length > 0) {
+          // Tag emails with folder name as supplierName for filtering
+          // until DB supplier_id is resolved
+          const folderName = data.syncKey ? data.syncKey.split('/').pop() : null;
+          const emails = folderName
+            ? data.emails.map((e: any) => ({ ...e, supplierName: e.supplierName || folderName }))
+            : data.emails;
+          dispatch({ type: 'MERGE_REAL_EMAILS', payload: emails });
+        }
       });
     }
 
@@ -369,7 +393,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const getFilteredEmails = () => {
     let emails = state.emails;
     if (state.selectedSupplierId !== null) {
-      emails = emails.filter(e => e.supplierId === state.selectedSupplierId);
+      const selectedSupplier = state.suppliers.find((s: any) => s.id === state.selectedSupplierId);
+      emails = emails.filter(e => {
+        if (e.supplierId === state.selectedSupplierId) return true;
+        if (selectedSupplier && e.extracted?.supplier) {
+          const a = e.extracted.supplier.toUpperCase();
+          const b = selectedSupplier.name.toUpperCase();
+          if (a.includes(b) || b.includes(a)) return true;
+        }
+        if (selectedSupplier && e.supplierName) {
+          if (e.supplierName.toUpperCase().includes(selectedSupplier.name.toUpperCase())) return true;
+        }
+        return false;
+      });
     }
     return emails;
   };

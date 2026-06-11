@@ -15,6 +15,8 @@ from database import (
     get_supplier_by_domain, upsert_supplier,
     queue_emails_for_nlp, get_next_nlp_pending, mark_nlp_processing,
     save_nlp_result, mark_nlp_failed, get_nlp_results, get_nlp_queue_stats,
+    reset_stuck_processing, run_migration_004,
+    get_supplier_id_by_sender, add_supplier_contact_email, get_supplier_contact_emails,
     run_migration_002, run_migration_003,
     reset_stuck_processing,
     get_or_create_supplier_by_folder, list_suppliers_with_stats,
@@ -47,7 +49,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     await run_migration_002()
     await run_migration_003()
-    await reset_stuck_processing()   # recover any rows stuck from previous crash
+    await run_migration_004()
+    await reset_stuck_processing()
     _start_time = time.time()
 
     logger.info("Service ready on %s:%d", HOST, PORT)
@@ -176,7 +179,14 @@ async def mbox_parse(request: MboxParseRequest):
 async def db_store_email(request: DbEmailRequest):
     """Store a parsed email in SQLite."""
     try:
-        result = await upsert_email(request.model_dump())
+        # Auto-resolve supplier_id from sender email if not provided
+        data = request.model_dump()
+        if not data.get("supplier_id") and data.get("sender_email"):
+            resolved = await get_supplier_id_by_sender(data["sender_email"])
+            if resolved:
+                data["supplier_id"] = resolved
+
+        result = await upsert_email(data)
         return DbEmailResponse(
             success=True,
             email_id=result["email_id"],
@@ -292,7 +302,62 @@ async def db_override_email_step(request: EmailStepOverrideRequest):
     }
 
 
+# ── Supplier contact email management ────────────────────────────────────────
 
+@app.get("/db/supplier/{supplier_id}/contacts")
+async def get_supplier_contacts(supplier_id: int):
+    """Get all contact email patterns for a supplier."""
+    patterns = await get_supplier_contact_emails(supplier_id)
+    return {"supplier_id": supplier_id, "patterns": patterns}
+
+
+class AddContactEmailRequest(BaseModel):
+    email_pattern: str   # full address like "ivy@cnspeedway.com" OR domain "@cnspeedway.com"
+
+
+@app.post("/db/supplier/{supplier_id}/contacts")
+async def add_supplier_contact(supplier_id: int, request: AddContactEmailRequest):
+    """
+    Add a contact email pattern to a supplier.
+    Pattern can be:
+      - Full address: "ivy@cnspeedway.com"  → match_type='address'
+      - Domain:       "@cnspeedway.com"     → match_type='domain'
+
+    After adding, re-links all existing unmatched emails that match this pattern.
+    """
+    pattern = request.email_pattern.strip().lower()
+    match_type = "domain" if pattern.startswith("@") else "address"
+
+    ok = await add_supplier_contact_email(supplier_id, pattern, match_type)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to add contact email")
+
+    # Re-link existing emails that match this new pattern
+    from database import get_db
+    import re
+    db = await get_db()
+    if match_type == "address":
+        await db.execute(
+            "UPDATE emails SET supplier_id=? WHERE supplier_id IS NULL AND LOWER(sender_email) LIKE ?",
+            (supplier_id, f"%{pattern}%")
+        )
+    else:
+        domain = pattern[1:]  # strip leading @
+        await db.execute(
+            "UPDATE emails SET supplier_id=? WHERE supplier_id IS NULL AND LOWER(sender_email) LIKE ?",
+            (supplier_id, f"%@{domain}%")
+        )
+    await db.commit()
+    relinked = db.total_changes
+
+    logger.info("[SUPPLIER] Added contact %s to supplier %d, relinked %d emails", pattern, supplier_id, relinked)
+    return {
+        "success": True,
+        "supplier_id": supplier_id,
+        "pattern": pattern,
+        "match_type": match_type,
+        "emails_relinked": relinked,
+    }
 
 
 @app.get("/db/supplier", response_model=DbSupplierResponse)

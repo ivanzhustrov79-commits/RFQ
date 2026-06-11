@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     onAutoSync: (callback) => ipcRenderer.on('thunderbird:autoSync', (_event, data) => callback(data)),
     onFolderUpdate: (callback) => ipcRenderer.on('thunderbird:folderUpdate', (_event, data) => callback(data)),
     onSyncError: (callback) => ipcRenderer.on('thunderbird:syncError', (_event, error) => callback(error)),
+    setSyncFromDate: (date) => ipcRenderer.invoke('thunderbird:setSyncFromDate', date),
   },
   suppliers: {
     list: () => ipcRenderer.invoke('suppliers:list'),
