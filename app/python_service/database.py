@@ -333,7 +333,8 @@ async def queue_emails_for_nlp(message_ids: List[str]) -> int:
 
 async def get_next_nlp_pending() -> Optional[Dict[str, Any]]:
     """Get the next email waiting for LLM enrichment.
-    Also auto-recovers rows stuck in 'processing' for more than 10 minutes."""
+    Skips 'manual' rows (user-overridden) and auto-recovers rows stuck
+    in 'processing' for more than 10 minutes."""
     db = await get_db()
     # Recover any rows that got stuck in processing (worker crash/restart)
     await db.execute("""
@@ -432,7 +433,7 @@ async def get_nlp_queue_stats() -> Dict[str, int]:
         GROUP BY nlp_status
     """)
     rows = await cursor.fetchall()
-    stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0, "skipped": 0}
+    stats = {"pending": 0, "processing": 0, "completed": 0, "failed": 0, "skipped": 0, "manual": 0}
     for row in rows:
         status = row["nlp_status"] or "pending"
         if status in stats:

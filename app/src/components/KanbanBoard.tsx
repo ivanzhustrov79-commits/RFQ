@@ -2,6 +2,7 @@
 import { useApp } from '@/context/AppContext';
 import type { Email } from '@/types';
 import { EmailCard } from './EmailCard';
+import { EmailDetailPanel } from './EmailDetailPanel';
 import { workflowSteps } from '@/lib/mockData';
 import { useState, useCallback } from 'react';
 
@@ -9,33 +10,88 @@ export function KanbanBoard() {
   const { state, dispatch, getFilteredEmails } = useApp();
   const filteredEmails = getFilteredEmails();
   const selectedSupplier = state.suppliers.find(s => s.id === state.selectedSupplierId);
+
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
     email: Email | null;
   } | null>(null);
 
+  const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
+  const [overrideLoading, setOverrideLoading] = useState<string | null>(null); // messageId being overridden
+
+  const handleCardClick = useCallback((email: Email) => {
+    setSelectedEmail(prev => prev?.id === email.id ? null : email);
+  }, []);
+
+  const handleClosePanel = useCallback(() => setSelectedEmail(null), []);
+
   const handleContextMenu = useCallback((e: React.MouseEvent, email: Email) => {
     e.preventDefault();
+    e.stopPropagation();
     setContextMenu({ x: e.clientX, y: e.clientY, email });
   }, []);
 
   const handleCloseContextMenu = useCallback(() => setContextMenu(null), []);
 
-  const handleTroubleshoot = useCallback((_level: 1 | 2 | 3 | 4) => {
-    if (contextMenu?.email) {
-      dispatch({
-        type: 'OPEN_TROUBLESHOOT',
-        payload: { level: 1, targetId: contextMenu.email.id },
-      });
-    }
+  const handleStepOverride = useCallback(async (targetStep: number) => {
+    const email = contextMenu?.email;
+    if (!email) return;
     setContextMenu(null);
+
+    const previousStep = email.stepAssigned ?? 0;
+    if (previousStep === targetStep) return; // no-op
+
+    setOverrideLoading(email.messageId);
+
+    // Optimistic update — move card immediately
+    dispatch({
+      type: 'OVERRIDE_EMAIL_STEP',
+      payload: { messageId: email.messageId, newStep: targetStep },
+    });
+
+    // Also update selectedEmail panel if it's showing this email
+    setSelectedEmail(prev =>
+      prev?.messageId === email.messageId
+        ? { ...prev, stepAssigned: targetStep, isLowConfidence: false, hasConflict: false }
+        : prev
+    );
+
+    try {
+      const res = await fetch('http://127.0.0.1:8721/db/email/step', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message_id: email.messageId,
+          new_step: targetStep,
+          previous_step: previousStep,
+        }),
+      });
+      if (!res.ok) {
+        console.warn('[OVERRIDE] Failed:', await res.text());
+        // Roll back optimistic update
+        dispatch({
+          type: 'OVERRIDE_EMAIL_STEP',
+          payload: { messageId: email.messageId, newStep: previousStep },
+        });
+      }
+    } catch (err) {
+      console.warn('[OVERRIDE] Network error:', err);
+      dispatch({
+        type: 'OVERRIDE_EMAIL_STEP',
+        payload: { messageId: email.messageId, newStep: previousStep },
+      });
+    } finally {
+      setOverrideLoading(null);
+    }
   }, [contextMenu, dispatch]);
 
   const emailsByStep = workflowSteps.map(step => ({
     step,
     emails: filteredEmails.filter(e => e.stepAssigned === step.id),
   }));
+
+  const currentStep = contextMenu?.email?.stepAssigned ?? -1;
 
   return (
     <div
@@ -107,7 +163,14 @@ export function KanbanBoard() {
                 </div>
               ) : (
                 emails.map(email => (
-                  <EmailCard key={email.id} email={email} onContextMenu={handleContextMenu} />
+                  <EmailCard
+                    key={email.id}
+                    email={email}
+                    isSelected={selectedEmail?.id === email.id}
+                    isOverriding={overrideLoading === email.messageId}
+                    onCardClick={handleCardClick}
+                    onContextMenu={handleContextMenu}
+                  />
                 ))
               )}
             </div>
@@ -115,32 +178,67 @@ export function KanbanBoard() {
         ))}
       </div>
 
+      {/* ── Detail panel ── */}
+      <EmailDetailPanel email={selectedEmail} onClose={handleClosePanel} />
+
+      {/* ── Step override context menu ── */}
       {contextMenu && contextMenu.email && (
         <>
           <div className="fixed inset-0 z-[60]" onClick={handleCloseContextMenu} />
           <div
-            className="fixed z-[70] w-44 rounded-md overflow-hidden py-1"
+            className="fixed z-[70] w-52 rounded-md overflow-hidden py-1"
             style={{
-              left: contextMenu.x,
-              top: contextMenu.y,
+              left: Math.min(contextMenu.x, window.innerWidth - 220),
+              top: Math.min(contextMenu.y, window.innerHeight - 220),
               backgroundColor: 'var(--dark-bg)',
               border: '1px solid var(--border-color)',
               boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
             }}
           >
-            <div className="px-3 py-1 text-micro uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
-              Email Level 1
+            <div className="px-3 py-1.5" style={{ borderBottom: '1px solid var(--border-color)' }}>
+              <p className="text-micro uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+                Move to step
+              </p>
+              <p className="text-micro truncate mt-0.5" style={{ color: 'var(--text-secondary)' }}>
+                {contextMenu.email.subject || '(no subject)'}
+              </p>
             </div>
-            {['Wrong Step', 'Duplicate', 'Missing Attachment', 'Other Issue'].map((item) => (
-              <button
-                key={item}
-                className="w-full text-left px-3 py-1.5 text-body transition-colors hover:bg-[var(--brand-plum)] hover:text-white"
-                style={{ color: 'var(--text-secondary)' }}
-                onClick={() => handleTroubleshoot(1)}
-              >
-                {item}
-              </button>
-            ))}
+            {workflowSteps.map((step) => {
+              const isCurrent = step.id === currentStep;
+              return (
+                <button
+                  key={step.id}
+                  className="w-full text-left px-3 py-1.5 flex items-center gap-2 transition-colors"
+                  style={{
+                    color: isCurrent ? 'var(--text-tertiary)' : 'var(--text-secondary)',
+                    backgroundColor: isCurrent ? 'rgba(128,128,128,0.08)' : 'transparent',
+                    cursor: isCurrent ? 'default' : 'pointer',
+                  }}
+                  disabled={isCurrent}
+                  onClick={() => !isCurrent && handleStepOverride(step.id)}
+                  onMouseEnter={(e) => {
+                    if (!isCurrent) e.currentTarget.style.backgroundColor = 'rgba(73,40,96,0.3)';
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!isCurrent) e.currentTarget.style.backgroundColor = 'transparent';
+                  }}
+                >
+                  <span
+                    className="shrink-0 w-4 h-4 rounded-full flex items-center justify-center text-micro font-bold"
+                    style={{
+                      backgroundColor: isCurrent ? 'var(--text-tertiary)' : 'var(--brand-plum)',
+                      color: 'white',
+                    }}
+                  >
+                    {step.id}
+                  </span>
+                  <span className="text-body">{step.stepName}</span>
+                  {isCurrent && (
+                    <span className="ml-auto text-micro" style={{ color: 'var(--text-tertiary)' }}>current</span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </>
       )}

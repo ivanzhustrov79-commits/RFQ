@@ -88,7 +88,15 @@ async def log_requests(request, call_next):
 # 1.  NEW MODEL  (add near the other model imports at the top,
 #     or just inline here — FastAPI doesn't care where it lives)
 # ─────────────────────────────────────────────────────────────
+
+# ── 1. NEW MODEL ──────────────────────────────────────────────────────────────
 from pydantic import BaseModel
+
+class EmailStepOverrideRequest(BaseModel):
+    message_id: str          # identifies which email
+    new_step: int            # 0–5
+    previous_step: int = 0  # AI-assigned step (for deviation logging)
+
 
 class RfqNameRequest(BaseModel):
     supplier_name: str          # e.g. "Camso"
@@ -208,6 +216,83 @@ async def db_get_emails(
         raise HTTPException(status_code=500, detail={
             "success": False, "error": "DB_ERROR", "error_detail": str(e),
         })
+
+
+# ── 2. NEW ROUTE ──────────────────────────────────────────────────────────────
+@app.patch("/db/email/step")
+async def db_override_email_step(request: EmailStepOverrideRequest):
+    """
+    Manual step override by the user.
+
+    - Sets step_assigned to new_step in DB
+    - Sets nlp_status = 'manual' so background worker never touches it again
+    - Preserves original AI step + confidence in nlp_result for BOOST learning
+    - User can call this again at any time to change it further
+
+    Returns: { success: true, message_id, new_step, previous_step }
+    """
+    import json
+    from database import get_db
+
+    if not (0 <= request.new_step <= 5):
+        raise HTTPException(status_code=400, detail="new_step must be 0–5")
+
+    db = await get_db()
+
+    # Load existing nlp_result so we can preserve AI classification data
+    cursor = await db.execute(
+        "SELECT nlp_result, step_assigned FROM emails WHERE message_id = ?",
+        (request.message_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    existing_result = {}
+    if row["nlp_result"]:
+        try:
+            existing_result = json.loads(row["nlp_result"])
+        except json.JSONDecodeError:
+            pass
+
+    # Build updated result — preserve AI data, record override
+    updated_result = {
+        **existing_result,
+        "step": request.new_step,
+        "step_source": "manual",
+        "ai_step": existing_result.get("step", request.previous_step),      # original AI step
+        "ai_confidence": existing_result.get("confidence", 0),              # original confidence
+        "override_from_step": request.previous_step,
+        "override_at": __import__("datetime").datetime.utcnow().isoformat(),
+    }
+
+    await db.execute("""
+        UPDATE emails
+        SET step_assigned   = ?,
+            nlp_status      = 'manual',
+            nlp_result      = ?,
+            nlp_enriched_at = datetime('now')
+        WHERE message_id = ?
+    """, (request.new_step, json.dumps(updated_result), request.message_id))
+    await db.commit()
+
+    logger.info(
+        "[OVERRIDE] %s: step %d → %d (was AI=%d)",
+        request.message_id[:30],
+        request.previous_step,
+        request.new_step,
+        existing_result.get("step", request.previous_step),
+    )
+
+    return {
+        "success": True,
+        "message_id": request.message_id,
+        "new_step": request.new_step,
+        "previous_step": request.previous_step,
+    }
+
+
+
 
 
 @app.get("/db/supplier", response_model=DbSupplierResponse)

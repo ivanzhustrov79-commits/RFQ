@@ -119,7 +119,8 @@ type Action =
   | { type: 'UPDATE_NLP_RESULTS'; payload: Record<string, { supplier_name: string | null; part_numbers: string[]; step: number; confidence: number }> }
   | { type: 'SET_NLP_STATS'; payload: { pending: number; processing: number; completed: number; failed: number } }
   // ── NEW ──
-  | { type: 'SET_RFQ_NAME'; payload: { supplierId: number; name: string; source: 'ai' | 'manual' } };
+  | { type: 'SET_RFQ_NAME'; payload: { supplierId: number; name: string; source: 'ai' | 'manual' } }
+  | { type: 'OVERRIDE_EMAIL_STEP'; payload: { messageId: string; newStep: number } };
 
 const initialState: AppState = {
   theme: 'dark', fontSize: 'medium', useRealData: false,
@@ -180,8 +181,8 @@ function appReducer(state: AppState, action: Action): AppState {
         return {
           ...e,
           extracted: { supplier: result.supplier_name || null, partNumbers: result.part_numbers || [] },
-          classification: { step: result.step || 0, confidence: result.confidence || 0 },
-          stepAssigned: result.step || e.stepAssigned,
+          classification: { step: result.step ?? 0, confidence: result.confidence || 0 },
+          stepAssigned: result.step != null ? result.step : e.stepAssigned,
         };
       });
       return { ...state, emails: updatedEmails };
@@ -197,6 +198,17 @@ function appReducer(state: AppState, action: Action): AppState {
           ...state.rfqNames,
           [key]: { name: action.payload.name, source: action.payload.source },
         },
+      };
+    }
+    case 'OVERRIDE_EMAIL_STEP': {
+      const { messageId, newStep } = action.payload;
+      return {
+        ...state,
+        emails: state.emails.map(e =>
+          e.messageId === messageId
+            ? { ...e, stepAssigned: newStep, isLowConfidence: false, hasConflict: false }
+            : e
+        ),
       };
     }
     default: return state;

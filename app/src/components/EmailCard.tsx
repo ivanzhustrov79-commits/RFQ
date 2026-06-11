@@ -3,17 +3,16 @@ import { Badge } from './Badge';
 import { Cpu, Hash } from 'lucide-react';
 import { format, parseISO, isValid } from 'date-fns';
 
-// Inline safe date formatter - prevents "Invalid time value" crashes
 function safeFormat(dateValue: string | Date | null | undefined, fmt: string = 'MMM d HH:mm', fallback: string = '—'): string {
   if (!dateValue) return fallback;
   try {
     let date: Date;
     if (dateValue instanceof Date) {
       date = dateValue;
-    } else if (dateValue.includes('T') || dateValue.match(/^\d{4}-\d{2}-\d{2}/)) {
+    } else if (typeof dateValue === 'string' && (dateValue.includes('T') || dateValue.match(/^\d{4}-\d{2}-\d{2}/))) {
       date = parseISO(dateValue);
     } else {
-      date = new Date(dateValue);
+      date = new Date(dateValue as string);
     }
     return isValid(date) ? format(date, fmt) : fallback;
   } catch {
@@ -23,17 +22,20 @@ function safeFormat(dateValue: string | Date | null | undefined, fmt: string = '
 
 interface EmailCardProps {
   email: Email;
+  isSelected?: boolean;
+  isOverriding?: boolean;
+  onCardClick?: (email: Email) => void;
   onContextMenu?: (e: React.MouseEvent, email: Email) => void;
 }
 
-export function EmailCard({ email, onContextMenu }: EmailCardProps) {
+export function EmailCard({ email, isSelected, isOverriding, onCardClick, onContextMenu }: EmailCardProps) {
   const getBorderStyle = () => {
+    if (isSelected) return '2px solid var(--brand-plum)';
     if (email.hasConflict) return '2px solid var(--amber-alert)';
     if (email.isLowConfidence) return '1px dashed var(--amber-alert)';
     return '1px solid var(--border-color)';
   };
 
-  // Determine step badge color based on confidence
   const getStepBadgeVariant = () => {
     const conf = email.classification?.confidence || 0;
     if (conf >= 0.8) return 'approved' as const;
@@ -45,18 +47,24 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
     <div
       className="email-card relative flex flex-col gap-1.5 p-2.5 rounded-md cursor-pointer transition-all duration-150"
       style={{
-        backgroundColor: 'var(--card-bg)',
+        backgroundColor: isSelected ? 'rgba(73,40,96,0.15)' : 'var(--card-bg)',
         border: getBorderStyle(),
-        boxShadow: '0 1px 3px rgba(0,0,0,0.4)',
-        opacity: email.isLowConfidence ? 0.7 : 1,
+        boxShadow: isSelected ? '0 0 0 1px var(--brand-plum)' : '0 1px 3px rgba(0,0,0,0.4)',
+        opacity: isOverriding ? 0.5 : (email.isLowConfidence && !isSelected ? 0.7 : 1),
+        pointerEvents: isOverriding ? 'none' : 'auto',
       }}
+      onClick={() => onCardClick?.(email)}
       onMouseEnter={(e) => {
-        e.currentTarget.style.transform = 'translateY(-1px)';
-        e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
+        if (!isSelected) {
+          e.currentTarget.style.transform = 'translateY(-1px)';
+          e.currentTarget.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
+        }
       }}
       onMouseLeave={(e) => {
-        e.currentTarget.style.transform = 'translateY(0)';
-        e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.4)';
+        if (!isSelected) {
+          e.currentTarget.style.transform = 'translateY(0)';
+          e.currentTarget.style.boxShadow = '0 1px 3px rgba(0,0,0,0.4)';
+        }
       }}
       onContextMenu={(e) => onContextMenu?.(e, email)}
     >
@@ -87,16 +95,13 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
         {email.subject}
       </p>
 
-      {/* ── Supplier + Step Badges (ALWAYS show if available) ── */}
       <div className="flex flex-col gap-1 pl-3">
-        {/* Supplier name from cross-mailbox matching */}
         {(email.supplierName || email.extracted?.supplier) && (
           <div className="flex items-center gap-1 flex-wrap">
             <Badge variant="smart" className="max-w-[180px] truncate" title={email.supplierName || email.extracted?.supplier || ''}>
               <Cpu className="w-3 h-3 mr-1 shrink-0" />
               {email.supplierName || email.extracted?.supplier}
             </Badge>
-            {/* Step badge: from stepAssigned (BASE) or classification.step (SMART) */}
             {(email.stepAssigned || email.classification?.step) ? (
               <Badge variant={getStepBadgeVariant()} title={`Step ${email.stepAssigned || email.classification?.step}`}>
                 Step {email.stepAssigned || email.classification?.step}
@@ -105,7 +110,6 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
           </div>
         )}
 
-        {/* Part number pills from NLP enrichment */}
         {email.extracted?.partNumbers && email.extracted.partNumbers.length > 0 && (
           <div className="flex items-center gap-1 flex-wrap">
             {email.extracted.partNumbers.slice(0, 3).map((part, idx) => (
@@ -131,7 +135,6 @@ export function EmailCard({ email, onContextMenu }: EmailCardProps) {
           </div>
         )}
 
-        {/* NLP enrichment indicator */}
         {email.classification?.confidence && email.classification.confidence > 0 && (
           <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>
             Confidence: {Math.round(email.classification.confidence * 100)}%

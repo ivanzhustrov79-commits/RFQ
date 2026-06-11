@@ -89,6 +89,29 @@ async function queueEmailsForBackgroundNLP(emails) {
   }
 }
 
+// ── Supplier cache for folder→supplierId resolution ──
+let _suppliersCache = []; // refreshed on each sync cycle
+
+async function refreshSuppliersCache() {
+  if (!pythonAvailable) return;
+  try {
+    const result = await callPython('/db/suppliers', null, 'GET');
+    if (result?.suppliers) {
+      _suppliersCache = result.suppliers;
+    }
+  } catch (e) { /* keep existing cache */ }
+}
+
+function resolveSupplierIdByFolder(folderName) {
+  if (!folderName || _suppliersCache.length === 0) return null;
+  const normalized = folderName.trim().toUpperCase().replace(/-\d+$/, '');
+  const match = _suppliersCache.find(s =>
+    s.folder_name_normalized === normalized ||
+    s.name.toUpperCase() === normalized
+  );
+  return match ? match.id : null;
+}
+
 // ── Persist emails to SQLite via Python backend ──
 async function persistEmailsToDB(emails, syncKey) {
   if (!pythonAvailable || !emails || emails.length === 0) return;
@@ -98,7 +121,7 @@ async function persistEmailsToDB(emails, syncKey) {
   const folderPath = parts[1] || 'inbox';
 
   // Extract folder name for supplier matching (last path segment)
-  const folderName = syncKey.split('/').pop() || 'inbox';
+  const folderName = folderPath.split('/').pop() || folderPath;
 
   let stored = 0;
   let skipped = 0;
@@ -113,7 +136,8 @@ async function persistEmailsToDB(emails, syncKey) {
       try {
         const senderEmail = email.senderEmail || email.from || '';
         const domain = extractDomain(email.from || senderEmail);
-        // Derive numeric id same way finalizeEmail does
+        // Resolve supplier from folder name using local cache
+        const supplierId = email.supplierId || resolveSupplierIdByFolder(folderName) || null;
         const emailId = email.id || (email.messageId
           ? parseInt(email.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000)
           : Math.floor(Math.random() * 1000000));
@@ -135,7 +159,7 @@ async function persistEmailsToDB(emails, syncKey) {
           thread_id: email.threadId || null,
           step_assigned: email.stepAssigned || 0,
           rfq_id: null,
-          supplier_id: email.supplierId || null,
+          supplier_id: supplierId,
         });
         stored++;
       } catch (e) {
@@ -772,23 +796,98 @@ function parseMboxEmails(content, maxEmails) {
 function finalizeEmail(e) {
   if (!e.subject) e.subject = '(no subject)';
   if (!e.from) e.from = 'Unknown';
+  // Decode RFC 2047 encoded-word sequences in headers
+  e.subject = decodeEncodedWords(e.subject);
+  e.from = decodeEncodedWords(e.from);
   const bosses = ['info@field-pro.ae', 'vlebedinets@agro-pro2014.ru'];
   e.isInternal = bosses.some(b => e.from.toLowerCase().includes(b));
   e.isSentByUser = e.from.includes('izhustrov@import-detal36.ru');
-  e.body = e.body.trim();
+  e.body = cleanMimeBody(e.body || '');
   e.sentAt = e.date || new Date().toISOString();
   e.senderEmail = e.from;
-  e.senderName = e.from.split('@')[0] || 'Unknown';
+  // Extract display name from "Name <email>" format, fallback to email local part
+  const nameMatch = e.from.match(/^([^<]+)<[^>]+>/);
+  e.senderName = nameMatch ? nameMatch[1].trim() : (e.from.split('@')[0] || 'Unknown');
   e.rfqId = 0;
   e.supplierId = 0;
   e.stepAssigned = 0;
   e.threadConfidence = 1.0;
   e.hasConflict = false;
   e.id = e.messageId ? parseInt(e.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000) : Math.floor(Math.random() * 1000000);
-  // Initialize NLP fields
   e.extracted = { supplier: null, partNumbers: [] };
   e.classification = { step: 0, confidence: 0 };
   return e;
+}
+
+// Decode RFC 2047 encoded-word sequences in email headers
+// Handles =?charset?B?base64?= and =?charset?Q?quoted-printable?=
+function decodeEncodedWords(str) {
+  if (!str || !str.includes('=?')) return str;
+  return str.replace(/=\?([^?]+)\?([BQbq])\?([^?]*)\?=/g, (match, charset, encoding, encoded) => {
+    try {
+      if (encoding.toUpperCase() === 'B') {
+        // Base64
+        const bytes = Buffer.from(encoded, 'base64');
+        return bytes.toString(charset.toLowerCase().includes('utf') ? 'utf8' : 'latin1');
+      } else {
+        // Quoted-printable (Q encoding)
+        const qp = encoded.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+        return qp;
+      }
+    } catch {
+      return match;
+    }
+  });
+}
+function cleanMimeBody(raw) {
+  if (!raw) return '';
+
+  let text = raw;
+
+  // If multipart, extract the text/plain part first
+  const plainMatch = text.match(/Content-Type:\s*text\/plain[^\n]*\n(?:Content-[^\n]+\n)*\n([\s\S]*?)(?=\n--|\n\nContent-Type:|\s*$)/i);
+  if (plainMatch) {
+    text = plainMatch[1];
+  } else {
+    // Remove MIME boundary lines and Content-* headers
+    text = text.replace(/^--[^\n]+$/gm, '');
+    text = text.replace(/^Content-[^\n]+$/gim, '');
+  }
+
+  // Decode quoted-printable soft line breaks first
+  text = text.replace(/=\r?\n/g, '');
+  // Decode quoted-printable =XX hex sequences as UTF-8 bytes
+  // Collect consecutive =XX sequences and decode as a UTF-8 buffer
+  text = text.replace(/((?:=[0-9A-Fa-f]{2})+)/g, (match) => {
+    const bytes = match.match(/=[0-9A-Fa-f]{2}/g).map(h => parseInt(h.slice(1), 16));
+    try {
+      return Buffer.from(bytes).toString('utf8');
+    } catch {
+      return match;
+    }
+  });
+
+  // Strip <style>...</style> blocks entirely (content + tags)
+  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  // Strip <script>...</script> blocks
+  text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+
+  // Strip HTML tags if any remain
+  if (text.includes('<')) {
+    text = text.replace(/<br\s*\/?>/gi, '\n');
+    text = text.replace(/<\/?(div|p|tr|li|h[1-6])[^>]*>/gi, '\n');
+    text = text.replace(/<[^>]+>/g, '');
+    text = text.replace(/&nbsp;/gi, ' ')
+               .replace(/&amp;/gi, '&')
+               .replace(/&lt;/gi, '<')
+               .replace(/&gt;/gi, '>')
+               .replace(/&quot;/gi, '"');
+  }
+
+  // Collapse 3+ consecutive blank lines to 2
+  text = text.replace(/\n{3,}/g, '\n\n');
+
+  return text.trim();
 }
 
 ipcMain.handle('thunderbird:discover', () => {
@@ -869,17 +968,6 @@ ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
   }
 });
 
-// ── Suppliers: fetch from Python backend ──
-ipcMain.handle('suppliers:list', async () => {
-  try {
-    const result = await callPython('/db/suppliers', null, 'GET');
-    return result;
-  } catch (err) {
-    console.log('[SUPPLIERS] Failed to fetch:', err.message);
-    return { suppliers: [] };
-  }
-});
-
 // Perform full Thunderbird sync + health check
 async function runThunderbirdSync() {
   if (_isScanning) {
@@ -891,6 +979,7 @@ async function runThunderbirdSync() {
 
   try {
     console.log('[TB-SYNC] Starting auto-sync...');
+    await refreshSuppliersCache(); // ensure supplier→folder mapping is fresh
     const result = findThunderbirdProfiles();
 
     if (result.error) {
@@ -933,6 +1022,11 @@ async function runThunderbirdSync() {
         const content = fs.readFileSync(mboxPath, 'utf8');
         const emails = parseMboxEmails(content, 10000);
         if (emails.length > 0) {
+          // Resolve supplierId for all emails in this folder
+          const supplierId = resolveSupplierIdByFolder(folderName);
+          if (supplierId) {
+            for (const e of emails) e.supplierId = supplierId;
+          }
           // Persist to SQLite first (so NLP worker has body_text)
           if (pythonAvailable) {
             persistEmailsToDB(emails, syncKey).catch(() => {});
