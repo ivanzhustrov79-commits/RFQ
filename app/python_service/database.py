@@ -151,22 +151,31 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
     existing = await cursor.fetchone()
 
     if existing:
-        # Update
+        # Update metadata only — never overwrite NLP results, step_assigned, or supplier_id
+        # if they were already set by SMART mode
         await db.execute("""
             UPDATE emails SET
                 profile_name = ?, account_email = ?, folder_path = ?,
                 subject = ?, sender_email = ?, sender_name = ?,
-                sent_at = ?, body_text = ?, body_language = ?,
-                has_attachments = ?, thread_id = ?, step_assigned = ?,
-                rfq_id = ?, supplier_id = ?, parsed_at = datetime('now')
+                sent_at = ?, body_language = ?,
+                has_attachments = ?, thread_id = ?,
+                -- Only update body_text if not yet enriched (NLP needs it once)
+                body_text = CASE WHEN nlp_status IS NULL THEN ? ELSE body_text END,
+                -- Only update supplier_id if not yet resolved
+                supplier_id = CASE WHEN supplier_id IS NULL THEN ? ELSE supplier_id END,
+                -- Never overwrite step_assigned if SMART already classified it
+                step_assigned = CASE WHEN nlp_status IN ('completed','manual') THEN step_assigned ELSE ? END,
+                parsed_at = datetime('now')
             WHERE message_id = ?
         """, (
             data.get("profile_name"), data.get("account_email"), data.get("folder_path"),
             data.get("subject"), data.get("sender_email"), data.get("sender_name"),
-            data.get("sent_at"), data.get("body_text"), data.get("body_language"),
+            data.get("sent_at"), data.get("body_language"),
             1 if data.get("has_attachments") else 0,
-            data.get("thread_id"), data.get("step_assigned", 0),
-            data.get("rfq_id"), data.get("supplier_id"),
+            data.get("thread_id"),
+            data.get("body_text"),       # for body_text CASE
+            data.get("supplier_id"),     # for supplier_id CASE
+            data.get("step_assigned", 0), # for step_assigned CASE
             data.get("message_id"),
         ))
         await db.commit()
@@ -299,7 +308,7 @@ async def upsert_supplier(data: Dict[str, Any]) -> Dict[str, Any]:
 
 async def queue_emails_for_nlp(message_ids: List[str]) -> int:
     """Mark emails as pending for background LLM enrichment.
-    Only queues emails that haven't been successfully completed or manually overridden."""
+    Only queues emails that haven't been completed or manually overridden."""
     db = await get_db()
     placeholders = ','.join('?' * len(message_ids))
     await db.execute(f"""
@@ -318,8 +327,7 @@ async def queue_emails_for_nlp(message_ids: List[str]) -> int:
 
 async def get_next_nlp_pending() -> Optional[Dict[str, Any]]:
     """Get the next email waiting for LLM enrichment.
-    Skips 'manual' rows (user-overridden) and auto-recovers rows stuck
-    in 'processing' for more than 10 minutes."""
+    Skips 'manual' rows and auto-recovers rows stuck in 'processing' > 10 min."""
     db = await get_db()
     await db.execute("""
         UPDATE emails SET nlp_status = 'pending'
@@ -328,7 +336,6 @@ async def get_next_nlp_pending() -> Optional[Dict[str, Any]]:
         AND parsed_at < datetime('now', '-10 minutes')
     """)
     await db.commit()
-
     cursor = await db.execute("""
         SELECT id, message_id, subject, body_text, sender_email, body_language
         FROM emails
@@ -375,20 +382,6 @@ async def save_nlp_result(email_id: int, result: Dict[str, Any]) -> None:
     await db.commit()
 
 
-async def reset_stuck_processing() -> int:
-    """Reset any emails stuck in 'processing' state back to 'pending'.
-    Call on service startup to recover from crashes."""
-    db = await get_db()
-    await db.execute(
-        "UPDATE emails SET nlp_status = 'pending' WHERE nlp_status = 'processing'"
-    )
-    await db.commit()
-    count = db.total_changes
-    if count:
-        logger.info("[DB] Reset %d stuck 'processing' emails back to 'pending'", count)
-    return count
-
-
 async def mark_nlp_failed(email_id: int) -> None:
     """Mark NLP processing as failed."""
     db = await get_db()
@@ -401,22 +394,25 @@ async def mark_nlp_failed(email_id: int) -> None:
 
 async def get_nlp_results(message_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Get NLP enrichment results for given message IDs.
-    Returns dict: message_id -> result dict."""
+    Returns dict: message_id -> result dict including supplier_id."""
     if not message_ids:
         return {}
     import json
     db = await get_db()
     placeholders = ','.join('?' * len(message_ids))
     cursor = await db.execute(f"""
-        SELECT message_id, nlp_status, nlp_result
+        SELECT message_id, nlp_status, nlp_result, supplier_id, step_assigned
         FROM emails
         WHERE message_id IN ({placeholders})
-        AND nlp_status = 'completed'
+        AND nlp_status IN ('completed', 'manual')
     """, message_ids)
     rows = await cursor.fetchall()
     results = {}
     for row in rows:
         result = json.loads(row["nlp_result"]) if row["nlp_result"] else {}
+        # Always include supplier_id and step_assigned from DB (authoritative)
+        result["supplier_id"] = row["supplier_id"]
+        result["step"] = row["step_assigned"]
         results[row["message_id"]] = result
     return results
 
@@ -582,83 +578,72 @@ async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+async def reset_stuck_processing() -> int:
+    """Reset emails stuck in 'processing' back to 'pending'. Call on startup."""
+    db = await get_db()
+    await db.execute("UPDATE emails SET nlp_status = 'pending' WHERE nlp_status = 'processing'")
+    await db.commit()
+    count = db.total_changes
+    if count:
+        logger.info("[DB] Reset %d stuck 'processing' emails back to 'pending'", count)
+    return count
+
+
 async def run_migration_004():
-    """Migration 004: sender-based supplier matching.
-    Adds supplier_contact_emails table for many-to-many email address → supplier mapping.
-    Also seeds it from existing contact_email and email_domain columns.
-    """
+    """Migration 004: sender-based supplier matching via supplier_contact_emails table."""
     db = await get_db()
     cursor = await db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='supplier_contact_emails'"
     )
     if await cursor.fetchone():
-        logger.debug("Migration 004 already applied")
         return
 
-    logger.info("Applying migration 004: sender-based supplier matching")
+    logger.info("Applying migration 004: supplier_contact_emails table")
     await db.executescript("""
         CREATE TABLE IF NOT EXISTS supplier_contact_emails (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             supplier_id INTEGER NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE,
-            email_pattern TEXT NOT NULL,   -- full address OR @domain.com
-            match_type TEXT DEFAULT 'domain',  -- 'address' | 'domain'
+            email_pattern TEXT NOT NULL,
+            match_type TEXT DEFAULT 'domain',
             created_at TEXT DEFAULT (datetime('now'))
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_sce_pattern
-            ON supplier_contact_emails(email_pattern);
-        CREATE INDEX IF NOT EXISTS idx_sce_supplier
-            ON supplier_contact_emails(supplier_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sce_pattern ON supplier_contact_emails(email_pattern);
+        CREATE INDEX IF NOT EXISTS idx_sce_supplier ON supplier_contact_emails(supplier_id);
     """)
 
-    # Seed from existing supplier email_domain and contact_email
     suppliers = await db.execute("SELECT id, email_domain, contact_email FROM suppliers")
     rows = await suppliers.fetchall()
     for row in rows:
-        sid = row["id"]
-        domain = row["email_domain"]
-        contact = row["contact_email"]
-
-        # Add domain pattern e.g. "@cnspeedway.com"
+        sid, domain, contact = row["id"], row["email_domain"], row["contact_email"]
         if domain and domain != "unknown":
             await db.execute(
                 "INSERT OR IGNORE INTO supplier_contact_emails (supplier_id, email_pattern, match_type) VALUES (?,?,?)",
                 (sid, f"@{domain.lower()}", "domain")
             )
-
-        # Add specific contact address if it looks like a real email
         if contact and "@" in contact:
             import re
-            addr_match = re.search(r'[\w.+-]+@[\w.-]+\.\w+', contact)
-            if addr_match:
+            addr = re.search(r'[\w.+-]+@[\w.-]+\.\w+', contact)
+            if addr:
                 await db.execute(
                     "INSERT OR IGNORE INTO supplier_contact_emails (supplier_id, email_pattern, match_type) VALUES (?,?,?)",
-                    (sid, addr_match.group(0).lower(), "address")
+                    (sid, addr.group(0).lower(), "address")
                 )
-
     await db.commit()
-    logger.info("Migration 004 applied — supplier contact email table seeded")
+    logger.info("Migration 004 applied")
 
 
 async def get_supplier_id_by_sender(sender_email: str) -> Optional[int]:
-    """
-    Resolve supplier_id from a sender email address.
-    Checks exact address match first, then domain match.
-    Returns None if no match found.
-    """
+    """Resolve supplier_id from sender email. Checks address then domain."""
     if not sender_email:
         return None
-
     import re
-    # Extract clean address from "Name <addr>" format
     addr_match = re.search(r'[\w.+-]+@[\w.-]+\.\w+', sender_email)
     if not addr_match:
         return None
     clean_addr = addr_match.group(0).lower()
     domain = "@" + clean_addr.split("@")[-1]
-
     db = await get_db()
 
-    # 1. Exact address match
     cursor = await db.execute(
         "SELECT supplier_id FROM supplier_contact_emails WHERE email_pattern = ? AND match_type = 'address'",
         (clean_addr,)
@@ -667,20 +652,15 @@ async def get_supplier_id_by_sender(sender_email: str) -> Optional[int]:
     if row:
         return row["supplier_id"]
 
-    # 2. Domain match
     cursor = await db.execute(
         "SELECT supplier_id FROM supplier_contact_emails WHERE email_pattern = ? AND match_type = 'domain'",
         (domain,)
     )
     row = await cursor.fetchone()
-    if row:
-        return row["supplier_id"]
-
-    return None
+    return row["supplier_id"] if row else None
 
 
 async def add_supplier_contact_email(supplier_id: int, email_pattern: str, match_type: str = "address") -> bool:
-    """Add a new email pattern to a supplier's contact list."""
     db = await get_db()
     try:
         await db.execute(
@@ -694,40 +674,35 @@ async def add_supplier_contact_email(supplier_id: int, email_pattern: str, match
         return False
 
 
-async def get_supplier_contact_emails(supplier_id: int) -> List[str]:
-    """Get all contact email patterns for a supplier."""
+async def get_supplier_contact_emails(supplier_id: int) -> List[Dict]:
     db = await get_db()
     cursor = await db.execute(
         "SELECT email_pattern, match_type FROM supplier_contact_emails WHERE supplier_id = ? ORDER BY match_type, email_pattern",
         (supplier_id,)
     )
-    rows = await cursor.fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
-    """List all suppliers with email counts and contact patterns."""
+    """List suppliers with email counts and contact patterns."""
     db = await get_db()
     cursor = await db.execute("""
-        SELECT
-            s.id, s.name, s.email_domain, s.contact_email,
+        SELECT s.id, s.name, s.email_domain, s.contact_email,
             s.folder_name_normalized, s.open_rfq_count,
             COUNT(e.id) as total_emails,
             SUM(CASE WHEN e.nlp_status IN ('completed','manual') THEN 1 ELSE 0 END) as enriched_emails
         FROM suppliers s
         LEFT JOIN emails e ON e.supplier_id = s.id
-        GROUP BY s.id
-        ORDER BY s.name
+        GROUP BY s.id ORDER BY s.name
     """)
     rows = await cursor.fetchall()
     result = []
     for row in rows:
         d = dict(row)
-        # Attach contact email patterns
-        ce_cursor = await db.execute(
+        ce = await db.execute(
             "SELECT email_pattern, match_type FROM supplier_contact_emails WHERE supplier_id = ?",
             (d["id"],)
         )
-        d["contact_patterns"] = [dict(r) for r in await ce_cursor.fetchall()]
+        d["contact_patterns"] = [dict(r) for r in await ce.fetchall()]
         result.append(d)
     return result

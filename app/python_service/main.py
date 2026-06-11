@@ -301,6 +301,29 @@ async def db_override_email_step(request: EmailStepOverrideRequest):
         "previous_step": request.previous_step,
     }
 
+@app.get("/db/email-supplier-map")
+async def db_email_supplier_map():
+    """
+    Returns a mapping of message_id -> supplier_id for all emails that have
+    a supplier_id set. Used by frontend to update React state on startup
+    so supplier filtering works before NLP results arrive.
+    """
+    from database import get_db
+    db = await get_db()
+    cursor = await db.execute("""
+        SELECT message_id, supplier_id, step_assigned, nlp_status
+        FROM emails
+        WHERE supplier_id IS NOT NULL
+    """)
+    rows = await cursor.fetchall()
+    result = {}
+    for row in rows:
+        result[row["message_id"]] = {
+            "supplier_id": row["supplier_id"],
+            "step_assigned": row["step_assigned"],
+            "nlp_status": row["nlp_status"],
+        }
+    return {"map": result, "count": len(result)}
 
 # ── Supplier contact email management ────────────────────────────────────────
 

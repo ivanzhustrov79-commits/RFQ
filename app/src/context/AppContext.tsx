@@ -124,6 +124,7 @@ type Action =
   | { type: 'TOGGLE_HIDDEN_ACCOUNT'; payload: string }
   | { type: 'UPDATE_NLP_RESULTS'; payload: Record<string, { supplier_name: string | null; part_numbers: string[]; step: number; confidence: number }> }
   | { type: 'SET_NLP_STATS'; payload: { pending: number; processing: number; completed: number; failed: number } }
+  | { type: 'APPLY_SUPPLIER_MAP'; payload: Record<string, { supplier_id: number; step_assigned: number }> }
   // ── NEW ──
   | { type: 'SET_RFQ_NAME'; payload: { supplierId: number; name: string; source: 'ai' | 'manual' } }
   | { type: 'OVERRIDE_EMAIL_STEP'; payload: { messageId: string; newStep: number } };
@@ -153,9 +154,19 @@ function appReducer(state: AppState, action: Action): AppState {
     case 'TOGGLE_DATA_SOURCE': return { ...state, useRealData: !state.useRealData };
     case 'SET_REAL_EMAILS': return { ...state, emails: action.payload, useRealData: true };
     case 'MERGE_REAL_EMAILS': {
-      const existingIds = new Set(state.emails.map(e => e.messageId));
-      const newEmails = action.payload.filter((e: Email) => !existingIds.has(e.messageId));
-      return { ...state, emails: [...state.emails, ...newEmails], useRealData: true };
+      const existingMap = new Map(state.emails.map(e => [e.messageId, e]));
+      const merged = [...state.emails];
+      for (const incoming of action.payload) {
+        const existing = existingMap.get(incoming.messageId);
+        if (!existing) {
+          merged.push(incoming);
+        } else if (incoming.supplierId && !existing.supplierId) {
+          // Update supplierId on existing email if incoming has it
+          const idx = merged.findIndex(e => e.messageId === incoming.messageId);
+          if (idx >= 0) merged[idx] = { ...existing, supplierId: incoming.supplierId };
+        }
+      }
+      return { ...state, emails: merged, useRealData: true };
     }
     case 'SET_THUNDERBIRD_DATA': return { ...state, thunderbirdData: action.payload };
     case 'TOGGLE_THUNDERBIRD_PANEL': return { ...state, isThunderbirdPanelOpen: !state.isThunderbirdPanelOpen };
@@ -197,14 +208,34 @@ function appReducer(state: AppState, action: Action): AppState {
         if (!result) return e;
         return {
           ...e,
-          extracted: { supplier: result.supplier_name || null, partNumbers: result.part_numbers || [] },
-          classification: { step: result.step ?? 0, confidence: result.confidence || 0 },
+          supplierId: result.supplier_id ?? e.supplierId,
+          extracted: {
+            supplier: result.supplier_name || null,
+            partNumbers: result.part_numbers || [],
+          },
+          classification: {
+            step: result.step ?? 0,
+            confidence: result.confidence || 0,
+          },
           stepAssigned: result.step != null ? result.step : e.stepAssigned,
         };
       });
       return { ...state, emails: updatedEmails };
     }
     case 'SET_NLP_STATS': return { ...state, nlpStats: action.payload };
+    case 'APPLY_SUPPLIER_MAP': {
+      const map = action.payload;
+      const updatedEmails = state.emails.map(e => {
+        const entry = map[e.messageId];
+        if (!entry) return e;
+        return {
+          ...e,
+          supplierId: entry.supplier_id,
+          stepAssigned: entry.step_assigned ?? e.stepAssigned,
+        };
+      });
+      return { ...state, emails: updatedEmails };
+    }
     case 'SET_SUPPLIERS': return { ...state, suppliers: action.payload };
     // ── NEW ──
     case 'SET_RFQ_NAME': {
@@ -286,6 +317,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // Track which supplier IDs we've already requested a name for (avoids duplicate calls)
   const nameRequestedRef = useRef<Set<number>>(new Set());
+
+  useEffect(() => {
+    saveSettings(state);
+  }, [state.theme, state.fontSize, state.syncedFolders, state.syncedFolderPaths,
+      state.hiddenAccounts, state.rfqNames, state.supplierSyncEnabled,
+      state.syncFromDate, state.skippedAccounts]);
 
   useEffect(() => {
     const api = (window as any).electronAPI;
@@ -381,15 +418,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     if (api.thunderbird?.onFolderUpdate) {
+      // Accumulate emails from all folders then set atomically
+      const folderBuffer: Record<string, any[]> = {};
       api.thunderbird.onFolderUpdate((data: any) => {
         if (data.emails?.length > 0) {
-          // Tag emails with folder name as supplierName for filtering
-          // until DB supplier_id is resolved
-          const folderName = data.syncKey ? data.syncKey.split('/').pop() : null;
-          const emails = folderName
-            ? data.emails.map((e: any) => ({ ...e, supplierName: e.supplierName || folderName }))
-            : data.emails;
-          dispatch({ type: 'MERGE_REAL_EMAILS', payload: emails });
+          const syncKey = data.syncKey || 'unknown';
+          folderBuffer[syncKey] = data.emails;
+          // Combine all buffered folder emails and set as complete state
+          const allEmails = Object.values(folderBuffer).flat();
+          dispatch({ type: 'SET_REAL_EMAILS', payload: allEmails });
         }
       });
     }
@@ -407,22 +444,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => { clearInterval(si); };
   }, []);
 
+  // Fetch supplier map from DB and apply to emails in state
+  useEffect(() => {
+    if (state.emails.length === 0) return;
+    const applyMap = () => {
+      fetch('http://127.0.0.1:8721/db/email-supplier-map')
+        .then(r => r.json())
+        .then(data => {
+          if (data.map && Object.keys(data.map).length > 0) {
+            dispatch({ type: 'APPLY_SUPPLIER_MAP', payload: data.map });
+          }
+        })
+        .catch(() => {});
+    };
+    applyMap();
+    // Retry after 2s in case DB is still writing during first call
+    const t = setTimeout(applyMap, 2000);
+    return () => clearTimeout(t);
+  }, [state.emails.length]);
+
   const getFilteredEmails = () => {
     let emails = state.emails;
     if (state.selectedSupplierId !== null) {
-      const selectedSupplier = state.suppliers.find((s: any) => s.id === state.selectedSupplierId);
-      emails = emails.filter(e => {
-        if (e.supplierId === state.selectedSupplierId) return true;
-        if (selectedSupplier && e.extracted?.supplier) {
-          const a = e.extracted.supplier.toUpperCase();
-          const b = selectedSupplier.name.toUpperCase();
-          if (a.includes(b) || b.includes(a)) return true;
-        }
-        if (selectedSupplier && e.supplierName) {
-          if (e.supplierName.toUpperCase().includes(selectedSupplier.name.toUpperCase())) return true;
-        }
-        return false;
-      });
+      const selectedId = Number(state.selectedSupplierId);
+      emails = emails.filter(e => Number(e.supplierId) === selectedId);
     }
     return emails;
   };

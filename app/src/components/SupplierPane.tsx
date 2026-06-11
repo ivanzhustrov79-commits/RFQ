@@ -95,6 +95,22 @@ export function SupplierPane() {
     }
   };
 
+  // Human-readable display names for cryptic Thunderbird server hostnames
+  const ACCOUNT_DISPLAY_NAMES = {
+    'yandex.com': 'izhustrov@yandex (import-detal36)',
+    'pop3.field-pro.ae': 'logistic@field-pro.ae (POP3)',
+    'europa-parts-1.kz': 'europa-parts-1.kz (empty)',
+    'Local Folders': 'Local Folders (sent/drafts)',
+  };
+
+  const sortedAccounts = [...accounts].sort((a, b) => {
+    const aSkipped = state.skippedAccounts.includes(a.name);
+    const bSkipped = state.skippedAccounts.includes(b.name);
+    if (aSkipped && !bSkipped) return 1;
+    if (!aSkipped && bSkipped) return -1;
+    return b.totalEmails - a.totalEmails; // most emails first within each group
+  });
+
   const sortedSuppliers = [...state.suppliers].sort((a, b) => {
     const aOn = state.supplierSyncEnabled[a.id] !== false;
     const bOn = state.supplierSyncEnabled[b.id] !== false;
@@ -242,15 +258,16 @@ export function SupplierPane() {
             <div className="pb-2">
               {accounts.length === 0
                 ? <p className="px-3 text-micro italic" style={S}>Loading…</p>
-                : accounts.map(({ name, totalEmails }) => {
+                : sortedAccounts.map(({ name, totalEmails }) => {
                   const isSkipped = state.skippedAccounts.includes(name);
+                  const displayName = ACCOUNT_DISPLAY_NAMES[name] || name;
                   return (
                     <button key={name} onClick={() => toggleAccount(name)}
                       className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-white/5 transition-colors"
-                      title={`Click to ${isSkipped ? 'enable' : 'disable'} ${name}`}>
+                      title={`${name}\nClick to ${isSkipped ? 'enable' : 'disable'}`}>
                       <span className="shrink-0 w-2 h-2 rounded-full" style={{ backgroundColor: isSkipped ? 'var(--red-urgent)' : 'var(--text-secondary)', opacity: isSkipped ? 0.6 : 0.8 }} />
                       <div className="flex-1 min-w-0">
-                        <span className="text-micro truncate block" style={{ color: isSkipped ? 'var(--text-tertiary)' : 'var(--text-secondary)' }}>{name}</span>
+                        <span className="text-micro truncate block" style={{ color: isSkipped ? 'var(--text-tertiary)' : 'var(--text-secondary)' }}>{displayName}</span>
                         <span className="text-micro" style={{ color: 'var(--text-tertiary)', opacity: 0.6 }}>{totalEmails?.toLocaleString()} emails</span>
                       </div>
                     </button>

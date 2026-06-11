@@ -1072,6 +1072,16 @@ async function runThunderbirdSync() {
 
     // Auto-reload synced folders that are still healthy
     console.log('[TB-SYNC] Reloading %d synced folders: %j', Object.keys(_syncedFolderPaths).length, Object.keys(_syncedFolderPaths));
+
+    // Fetch suppliers once for folder→supplierId resolution
+    let cachedSuppliers = [];
+    if (pythonAvailable) {
+      try {
+        const result = await callPython('/db/suppliers', null, 'GET');
+        cachedSuppliers = result.suppliers || [];
+      } catch (e) {}
+    }
+
     for (const [syncKey, mboxPath] of Object.entries(_syncedFolderPaths)) {
       if (missingFolders.includes(syncKey)) continue;
       try {
@@ -1081,6 +1091,22 @@ async function runThunderbirdSync() {
         const content = fs.readFileSync(mboxPath, 'utf8');
         const emails = parseMboxEmails(content, 10000);
         if (emails.length > 0) {
+          // Resolve supplierId for this folder using cached suppliers
+          let folderSupplierId = null;
+          const folderName = syncKey.split('/').pop() || '';
+          const folderUpper = folderName.toUpperCase();
+          const match = cachedSuppliers.find(s =>
+            s.folder_name_normalized === folderUpper ||
+            s.name.toUpperCase() === folderUpper
+          );
+          if (match) folderSupplierId = match.id;
+          console.log('[TB-SYNC] Folder "%s" -> supplierId=%s (from %d cached suppliers)', folderName, folderSupplierId, cachedSuppliers.length);
+
+          // Tag all emails with supplierId so React filter works immediately
+          if (folderSupplierId) {
+            for (const e of emails) e.supplierId = folderSupplierId;
+          }
+
           // Apply sync-from date filter for UI display (DB still gets all emails for NLP)
           const displayEmails = _syncFromDate
             ? emails.filter(e => {
