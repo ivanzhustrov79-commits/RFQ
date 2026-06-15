@@ -141,7 +141,88 @@ async def _create_tables_manual():
 
 async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
     """Insert or update email by message_id."""
+    import re
+
     db = await get_db()
+
+    # Module-level thread cache: (supplier_id, prefix) -> thread_id
+    # Avoids repeated DB lookups during bulk import
+    if not hasattr(upsert_email, '_thread_cache'):
+        upsert_email._thread_cache = {}
+
+    # Auto-resolve thread_id from subject + supplier_id if not provided
+    if not data.get("thread_id") and data.get("supplier_id") and data.get("subject"):
+        supplier_id = data["supplier_id"]
+        subject = data["subject"]
+
+        # Clean subject to get prefix
+        cleaned = subject
+        while True:
+            prev = cleaned
+            cleaned = re.sub(r'^(Re|Fwd|Fw|Re\[\d+\]|回复|转发)[\s:：]+', '', cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r'^\[.*?\]\s*', '', cleaned)
+            cleaned = cleaned.strip()
+            if cleaned == prev:
+                break
+        cleaned = re.sub(r'\s*[-–—]+\s*[^\x00-\x7F\s][^\x00-\x7F]*.*$', '', cleaned).strip()
+        cleaned = re.sub(r'\s*-\s*[A-ZА-Я][a-zа-яё]{2,}$', '', cleaned).strip()
+        if not cleaned:
+            cleaned = subject.strip()
+        prefix = ' '.join(cleaned.split()[:4])[:60]
+
+        cache_key = (supplier_id, prefix)
+
+        if cache_key in upsert_email._thread_cache:
+            data["thread_id"] = upsert_email._thread_cache[cache_key]
+        else:
+            # Look up thread in DB
+            row = await db.execute(
+                "SELECT id FROM threads WHERE supplier_id=? AND subject_prefix=?",
+                (supplier_id, prefix)
+            )
+            thread_row = await row.fetchone()
+
+            if thread_row:
+                thread_id = thread_row["id"]
+            else:
+                # Create new thread
+                cursor = await db.execute(
+                    "INSERT OR IGNORE INTO threads (supplier_id, subject_prefix) VALUES (?,?)",
+                    (supplier_id, prefix)
+                )
+                await db.commit()
+                if cursor.lastrowid:
+                    thread_id = cursor.lastrowid
+                else:
+                    row = await db.execute(
+                        "SELECT id FROM threads WHERE supplier_id=? AND subject_prefix=?",
+                        (supplier_id, prefix)
+                    )
+                    thread_row = await row.fetchone()
+                    thread_id = thread_row["id"] if thread_row else None
+
+            upsert_email._thread_cache[cache_key] = thread_id
+            data["thread_id"] = thread_id
+
+    # Auto-resolve supplier_id from folder_path if not provided
+    # This handles emails from multiple accounts with the same supplier folder
+    if not data.get("supplier_id") and data.get("folder_path"):
+        if not hasattr(upsert_email, '_supplier_folder_cache'):
+            upsert_email._supplier_folder_cache = {}
+
+        folder_upper = data["folder_path"].upper()
+        if folder_upper in upsert_email._supplier_folder_cache:
+            data["supplier_id"] = upsert_email._supplier_folder_cache[folder_upper]
+        else:
+            row = await db.execute(
+                "SELECT id FROM suppliers WHERE folder_name_normalized=?",
+                (folder_upper,)
+            )
+            supplier_row = await row.fetchone()
+            supplier_id_from_folder = supplier_row["id"] if supplier_row else None
+            upsert_email._supplier_folder_cache[folder_upper] = supplier_id_from_folder
+            if supplier_id_from_folder:
+                data["supplier_id"] = supplier_id_from_folder
 
     # Check if exists
     cursor = await db.execute(
@@ -158,7 +239,8 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
                 profile_name = ?, account_email = ?, folder_path = ?,
                 subject = ?, sender_email = ?, sender_name = ?,
                 sent_at = ?, body_language = ?,
-                has_attachments = ?, thread_id = ?,
+                has_attachments = ?,
+                thread_id = CASE WHEN thread_id IS NULL THEN ? ELSE thread_id END,
                 -- Only update body_text if not yet enriched (NLP needs it once)
                 body_text = CASE WHEN nlp_status IS NULL THEN ? ELSE body_text END,
                 -- Only update supplier_id if not yet resolved

@@ -83,6 +83,30 @@ def run():
 
     print(f"[THREADS] Processing {len(emails)} emails with supplier_id set...\n")
 
+    # Also grab emails where supplier_id is NULL but folder matches a supplier
+    unmatched = db.execute("""
+        SELECT e.id, e.message_id, e.folder_path, e.subject, s.id as supplier_id, s.name as supplier_name
+        FROM emails e
+        JOIN suppliers s ON UPPER(e.folder_path) = s.folder_name_normalized
+        WHERE e.supplier_id IS NULL
+    """).fetchall()
+
+    if unmatched:
+        print(f"[THREADS] Fixing supplier_id for {len(unmatched)} emails via folder match...")
+        for row in unmatched:
+            db.execute("UPDATE emails SET supplier_id=? WHERE id=?", (row['supplier_id'], row['id']))
+        db.commit()
+
+        # Re-fetch all emails with supplier_id
+        emails = db.execute("""
+            SELECT e.id, e.message_id, e.supplier_id, e.subject, s.name as supplier_name
+            FROM emails e
+            LEFT JOIN suppliers s ON s.id = e.supplier_id
+            WHERE e.supplier_id IS NOT NULL
+            ORDER BY e.supplier_id, e.subject
+        """).fetchall()
+        print(f"[THREADS] Now processing {len(emails)} emails total\n")
+
     # Reset existing threads for clean re-run
     db.execute("UPDATE emails SET thread_id = NULL")
     db.execute("DELETE FROM threads")

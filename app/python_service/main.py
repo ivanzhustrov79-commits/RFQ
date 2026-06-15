@@ -383,6 +383,16 @@ async def add_supplier_contact(supplier_id: int, request: AddContactEmailRequest
     }
 
 
+@app.get("/db/thread-count")
+async def get_thread_count():
+    """Get total thread count for settings display."""
+    from database import get_db
+    db = await get_db()
+    row = await db.execute("SELECT COUNT(*) as count FROM threads")
+    result = await row.fetchone()
+    return {"count": result["count"] if result else 0}
+
+
 @app.get("/db/supplier/{supplier_id}/threads")
 async def get_supplier_threads(supplier_id: int):
     """Get all threads for a supplier with email counts."""
@@ -415,23 +425,23 @@ async def get_thread_detail(thread_id: int):
     # Get emails
     rows = await db.execute("""
         SELECT message_id, subject, sender_email, sender_name,
-               sent_at, step_assigned, nlp_status, body_text,
-               extracted_supplier, extracted_parts
+               sent_at, step_assigned, nlp_status, nlp_result
         FROM emails
         WHERE thread_id = ?
         ORDER BY sent_at ASC
     """, (thread_id,))
     emails = await rows.fetchall()
 
-    # Get part numbers across thread
+    # Get part numbers across thread from nlp_result JSON
+    import json
     parts = set()
     for e in emails:
-        if e['extracted_parts']:
+        if e['nlp_result']:
             try:
-                import json
-                p = json.loads(e['extracted_parts'])
-                if isinstance(p, list):
-                    parts.update(p)
+                nlp = json.loads(e['nlp_result'])
+                for p in (nlp.get('part_numbers') or nlp.get('parts') or []):
+                    if p:
+                        parts.add(str(p))
             except:
                 pass
 

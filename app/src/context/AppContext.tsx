@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useEffect, useRef, type ReactNode } from 'react';
+import { createContext, useContext, useReducer, useEffect, useRef, useState, type ReactNode } from 'react';
 
 export interface Email {
   id: number;
@@ -447,31 +447,39 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // supplier map fetch removed - supplierId now set directly from folder name in main.js
 
+  // Fetch thread email IDs when thread selected
+  const [threadMessageIds, setThreadMessageIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!state.selectedThreadId) {
+      setThreadMessageIds(new Set());
+      return;
+    }
+    fetch(`http://127.0.0.1:8721/db/thread/${state.selectedThreadId}`)
+      .then(r => r.json())
+      .then(d => {
+        const ids = new Set<string>((d.emails || []).map((e: any) => e.message_id));
+        setThreadMessageIds(ids);
+      })
+      .catch(() => setThreadMessageIds(new Set()));
+  }, [state.selectedThreadId]);
+
   const getFilteredEmails = () => {
     let emails = state.emails;
     if (state.selectedSupplierId !== null) {
       const selectedId = Number(state.selectedSupplierId);
       emails = emails.filter(e => Number(e.supplierId) === selectedId);
     }
-    // Deduplicate by messageId (same email might be in multiple folders)
+    // Deduplicate by messageId
     const seen = new Set<string>();
     emails = emails.filter(e => {
       if (seen.has(e.messageId)) return false;
       seen.add(e.messageId);
       return true;
     });
-    // If a thread is selected, filter to only emails in that thread
-    // We match by subject prefix since React state doesn't have thread_id
-    if (state.selectedThreadId) {
-      const thread = state.threads.find((t: any) => t.id === state.selectedThreadId);
-      if (thread) {
-        const prefix = thread.subject_prefix.toLowerCase();
-        emails = emails.filter(e => {
-          const subj = (e.subject || '').toLowerCase()
-            .replace(/^(re|fwd|fw|回复|转发)[\s:：]+/gi, '').trim();
-          return subj.includes(prefix) || prefix.includes(subj.substring(0, 20));
-        });
-      }
+    // Filter by thread using DB message IDs
+    if (state.selectedThreadId && threadMessageIds.size > 0) {
+      emails = emails.filter(e => threadMessageIds.has(e.messageId));
     }
     return emails;
   };

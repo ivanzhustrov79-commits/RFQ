@@ -1,11 +1,34 @@
 // @ts-nocheck
 import { useApp } from '@/context/AppContext';
-import { useState } from 'react';
-import { X, Cpu, Globe, Database, Shield, Key, Sun, Moon } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { X, Cpu, Globe, Database, Shield, Key, Sun, Moon, Activity, RefreshCw } from 'lucide-react';
+
+function useNlpStats() {
+  const [stats, setStats] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = () => {
+    setLoading(true);
+    Promise.all([
+      fetch('http://127.0.0.1:8721/nlp/stats').then(r => r.json()),
+      fetch('http://127.0.0.1:8721/db/thread-count').then(r => r.json()).catch(() => ({ count: 0 })),
+    ])
+      .then(([nlp, threads]) => {
+        const s = nlp.stats || nlp;
+        setStats({ ...s, thread_count: threads.count || 0 });
+      })
+      .catch(() => setStats(null))
+      .finally(() => setLoading(false));
+  };
+
+  useEffect(() => { refresh(); }, []);
+  return { stats, loading, refresh };
+}
 
 export function SettingsPanel() {
   const { state, dispatch } = useApp();
   const [visible, setVisible] = useState(false);
+  const { stats: nlpStats, loading: nlpLoading, refresh: nlpRefresh } = useNlpStats();
 
   if (state.isSettingsOpen && !visible) setTimeout(() => setVisible(true), 10);
   if (!state.isSettingsOpen && visible) setTimeout(() => setVisible(false), 0);
@@ -79,10 +102,58 @@ export function SettingsPanel() {
 
           {/* DATABASE */}
           <SettingSection title="Database" icon={<Database className="w-4 h-4" />}>
-            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Schema version</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>v4.3.2 (001)</span></div>
-            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Total RFQs</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>16</span></div>
-            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Total emails</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>25</span></div>
-            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Agent memory rules</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>47</span></div>
+            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Schema version</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>v4.3.2</span></div>
+            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Total emails (DB)</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>{nlpStats ? (nlpStats.pending + nlpStats.processing + nlpStats.completed + nlpStats.failed + (nlpStats.manual || 0)) : '…'}</span></div>
+            <div className="flex items-center justify-between py-2"><span className="text-small" style={{ color: 'var(--text-secondary)' }}>Threads</span><span className="text-small font-medium" style={{ color: 'var(--text-primary)' }}>{nlpStats?.thread_count ?? '…'}</span></div>
+          </SettingSection>
+
+          {/* NLP STATS */}
+          <SettingSection title="NLP Processing" icon={<Activity className="w-4 h-4" />}>
+            <div className="flex items-center justify-between mb-2">
+              <span className="text-micro uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>Status</span>
+              <button onClick={nlpRefresh} disabled={nlpLoading} className="flex items-center gap-1 text-micro px-2 py-0.5 rounded transition-opacity hover:opacity-80" style={{ backgroundColor: 'rgba(107,61,139,0.2)', color: 'var(--plum-accent)' }}>
+                <RefreshCw className={`w-3 h-3 ${nlpLoading ? 'animate-spin' : ''}`} /> Refresh
+              </button>
+            </div>
+            {nlpStats ? (
+              <>
+                {[
+                  { label: 'Completed', value: nlpStats.completed, color: 'var(--green-success)' },
+                  { label: 'Manual override', value: nlpStats.manual || 0, color: 'var(--blue-ci)' },
+                  { label: 'Pending', value: nlpStats.pending, color: 'var(--amber-alert)' },
+                  { label: 'Processing', value: nlpStats.processing, color: 'var(--plum-accent)' },
+                  { label: 'Failed', value: nlpStats.failed, color: 'var(--red-urgent)' },
+                ].map(({ label, value, color }) => (
+                  <div key={label} className="flex items-center justify-between py-1.5">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                      <span className="text-small" style={{ color: 'var(--text-secondary)' }}>{label}</span>
+                    </div>
+                    <span className="text-small font-semibold" style={{ color }}>{value}</span>
+                  </div>
+                ))}
+                {/* Progress bar */}
+                {(() => {
+                  const total = nlpStats.pending + nlpStats.processing + nlpStats.completed + nlpStats.failed + (nlpStats.manual || 0);
+                  const done = nlpStats.completed + (nlpStats.manual || 0);
+                  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+                  return (
+                    <div className="mt-2">
+                      <div className="flex justify-between text-micro mb-1" style={{ color: 'var(--text-tertiary)' }}>
+                        <span>Progress</span><span>{pct}% ({done}/{total})</span>
+                      </div>
+                      <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--border-color)' }}>
+                        <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: 'var(--green-success)' }} />
+                      </div>
+                    </div>
+                  );
+                })()}
+              </>
+            ) : (
+              <p className="text-small italic" style={{ color: 'var(--text-tertiary)' }}>
+                {nlpLoading ? 'Loading…' : 'NLP service unavailable'}
+              </p>
+            )}
           </SettingSection>
 
           {/* SECURITY */}
