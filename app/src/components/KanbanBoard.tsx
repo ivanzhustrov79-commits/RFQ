@@ -128,7 +128,7 @@ export function KanbanBoard() {
         )}
       </div>
 
-      <div className="flex-1 flex overflow-x-auto overflow-y-hidden custom-scrollbar px-2 pb-2 gap-2">
+      <div key={`board-${state.selectedSupplierId ?? 'all'}`} className="flex-1 flex overflow-x-auto overflow-y-hidden custom-scrollbar px-2 pb-2 gap-2">
         {emailsByStep.map(({ step, emails }) => (
           <div
             key={step.id}
@@ -164,7 +164,7 @@ export function KanbanBoard() {
               ) : (
                 emails.map(email => (
                   <EmailCard
-                    key={email.id}
+                    key={email.messageId || email.id}
                     email={email}
                     isSelected={selectedEmail?.id === email.id}
                     isOverriding={overrideLoading === email.messageId}

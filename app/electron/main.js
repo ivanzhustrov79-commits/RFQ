@@ -786,7 +786,17 @@ function finalizeEmail(e) {
   e.stepAssigned = 0;
   e.threadConfidence = 1.0;
   e.hasConflict = false;
-  e.id = e.messageId ? parseInt(e.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000) : Math.floor(Math.random() * 1000000);
+  // Generate a stable numeric ID from messageId without collision risk
+  if (e.messageId) {
+    let hash = 0;
+    for (let i = 0; i < e.messageId.length; i++) {
+      hash = ((hash << 5) - hash) + e.messageId.charCodeAt(i);
+      hash |= 0; // Convert to 32bit int
+    }
+    e.id = Math.abs(hash);
+  } else {
+    e.id = Math.floor(Math.random() * 1000000000);
+  }
   e.extracted = { supplier: null, partNumbers: [] };
   e.classification = { step: 0, confidence: 0 };
   return e;
@@ -817,14 +827,30 @@ function cleanMimeBody(raw) {
 
   let text = raw;
 
+  // Check for Content-Transfer-Encoding header
+  const encodingMatch = text.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+  const encoding = encodingMatch ? encodingMatch[1].toLowerCase() : '';
+
   // If multipart, extract the text/plain part first
   const plainMatch = text.match(/Content-Type:\s*text\/plain[^\n]*\n(?:Content-[^\n]+\n)*\n([\s\S]*?)(?=\n--|\n\nContent-Type:|\s*$)/i);
   if (plainMatch) {
     text = plainMatch[1];
   } else {
-    // Remove MIME boundary lines and Content-* headers
+    // Remove MIME boundary lines and Content-* headers (including multiline headers)
     text = text.replace(/^--[^\n]+$/gm, '');
-    text = text.replace(/^Content-[^\n]+$/gim, '');
+    text = text.replace(/^Content-[^\n]+(?:\n\s+[^\n]+)*$/gim, '');
+  }
+
+  // Strip any remaining boundary= parameters
+  text = text.replace(/\bboundary=["']?[^\s;"']+["']?/gi, '');
+
+  // Decode base64 if needed
+  if (encoding === 'base64') {
+    try {
+      text = Buffer.from(text.replace(/\s/g, ''), 'base64').toString('utf8');
+    } catch (e) {
+      // Fall through if base64 decode fails
+    }
   }
 
   // Decode quoted-printable soft line breaks first
@@ -1016,16 +1042,10 @@ ipcMain.handle('thunderbird:setSyncFromDate', (_event, date) => {
 });
 // Receive synced folder paths from renderer (for health checks)
 ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
-  const prev = Object.keys(_syncedFolderPaths).length;
-  _syncedFolderPaths = paths || {};
-  const curr = Object.keys(_syncedFolderPaths).length;
-  console.log('[TB-SYNC] Received %d synced folder paths', curr);
-
-  // If we just received paths for the first time (or gained new ones),
-  // kick off a sync immediately so persistEmailsToDB runs without waiting 5 min.
-  if (curr > 0 && curr !== prev && pythonAvailable) {
-    setTimeout(runThunderbirdSync, 2000);
-  }
+  // Kept for backwards compatibility but no longer drives sync
+  // Auto-discovery now handles folder selection
+  const curr = paths ? Object.keys(paths).length : 0;
+  console.log('[TB-SYNC] setSyncedPaths received %d paths (auto-discovery active)', curr);
 });
 
 // Perform full Thunderbird sync + health check
@@ -1070,44 +1090,103 @@ async function runThunderbirdSync() {
     console.log('[TB-SYNC] Auto-sync complete: %d profiles, %d missing folders, %dms',
       result.profiles.length, missingFolders.length, Date.now() - t0);
 
-    // Auto-reload synced folders that are still healthy
-    console.log('[TB-SYNC] Reloading %d synced folders: %j', Object.keys(_syncedFolderPaths).length, Object.keys(_syncedFolderPaths));
+    // Auto-discover folders to sync:
+    // For each green supplier with a folder name → find its MBOX in active accounts
+    console.log('[TB-SYNC] Auto-discovering supplier folders...');
 
-    // Fetch suppliers once for folder→supplierId resolution
+    // Fetch suppliers once
     let cachedSuppliers = [];
     if (pythonAvailable) {
       try {
-        const result = await callPython('/db/suppliers', null, 'GET');
-        cachedSuppliers = result.suppliers || [];
+        const r = await callPython('/db/suppliers', null, 'GET');
+        cachedSuppliers = r.suppliers || [];
+        console.log('[TB-SYNC] Suppliers:', cachedSuppliers.map(s => `${s.name}(${s.folder_name_normalized})`).join(', '));
       } catch (e) {}
     }
 
-    for (const [syncKey, mboxPath] of Object.entries(_syncedFolderPaths)) {
-      if (missingFolders.includes(syncKey)) continue;
+    // Log active accounts and their folder count
+    for (const profile of (result.profiles || [])) {
+      for (const account of (profile.trees || [])) {
+        const accountName = account.name || '';
+        const accountLower = accountName.toLowerCase();
+        if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountLower)) continue;
+        console.log('[TB-SYNC] Active account:', accountName, '(%d folders)', (account.children || []).length);
+      }
+    }
+
+    // Build syncable folders from suppliers + profile folder structure
+    const foldersToSync = []; // [{syncKey, mboxPath, supplierId, supplierName}]
+
+    for (const profile of (result.profiles || [])) {
+      for (const account of (profile.trees || [])) {
+        // Skip if account is in skipped list
+        const accountName = account.name || '';
+        const accountLower = accountName.toLowerCase();
+        if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountLower)) continue;
+
+        // For each green supplier, find matching folder in this account
+        for (const supplier of cachedSuppliers) {
+          // Skip suppliers with sync disabled (supplierSyncEnabled handled client-side,
+          // so we check via the supplier_sync_enabled field if it exists, else default true)
+          const folderNorm = supplier.folder_name_normalized;
+          if (!folderNorm) continue;
+
+          // Search account children for matching folder
+          function findFolder(children) {
+            for (const child of (children || [])) {
+              const childUpper = (child.name || '').toUpperCase();
+              // Exact match only
+              if (childUpper === folderNorm) return child;
+              // Recurse into subfolders
+              const found = findFolder(child.children);
+              if (found) return found;
+            }
+            return null;
+          }
+
+          const folderNode = findFolder(account.children);
+          if (!folderNode || !folderNode.path) continue;
+
+          const mboxPath = folderNode.path;
+          if (!fs.existsSync(mboxPath)) continue;
+
+          const syncKey = `${profile.name}/${account.name}/${mboxPath}/${folderNode.name}`;
+          foldersToSync.push({
+            syncKey,
+            mboxPath,
+            supplierId: supplier.id,
+            supplierName: supplier.name,
+            folderName: folderNode.name,
+          });
+        }
+      }
+    }
+
+    console.log('[TB-SYNC] Found %d supplier folders to sync: %s',
+      foldersToSync.length,
+      foldersToSync.map(f => `${f.supplierName}(${f.folderName})`).join(', ')
+    );
+
+    // Send updated synced paths to renderer for UI display
+    const syncedPathsForRenderer = {};
+    for (const f of foldersToSync) {
+      syncedPathsForRenderer[f.syncKey] = f.mboxPath;
+    }
+
+    for (const { syncKey, mboxPath, supplierId, supplierName, folderName } of foldersToSync) {
       try {
         const stats = fs.statSync(mboxPath);
-        console.log('[TB-SYNC] Reloading folder %s: %s (%d bytes)', syncKey, mboxPath, stats.size);
-        if (stats.size > 500 * 1024 * 1024) { console.log('[TB-SYNC] Skipping %s: too large', syncKey); continue; }
+        if (stats.size > 500 * 1024 * 1024) {
+          console.log('[TB-SYNC] Skipping %s: too large (%d MB)', supplierName, Math.round(stats.size/1024/1024));
+          continue;
+        }
         const content = fs.readFileSync(mboxPath, 'utf8');
         const emails = parseMboxEmails(content, 10000);
         if (emails.length > 0) {
-          // Resolve supplierId for this folder using cached suppliers
-          let folderSupplierId = null;
-          const folderName = syncKey.split('/').pop() || '';
-          const folderUpper = folderName.toUpperCase();
-          const match = cachedSuppliers.find(s =>
-            s.folder_name_normalized === folderUpper ||
-            s.name.toUpperCase() === folderUpper
-          );
-          if (match) folderSupplierId = match.id;
-          console.log('[TB-SYNC] Folder "%s" -> supplierId=%s (from %d cached suppliers)', folderName, folderSupplierId, cachedSuppliers.length);
+          // Tag all emails with supplierId — already resolved from supplier record
+          for (const e of emails) e.supplierId = supplierId;
 
-          // Tag all emails with supplierId so React filter works immediately
-          if (folderSupplierId) {
-            for (const e of emails) e.supplierId = folderSupplierId;
-          }
-
-          // Apply sync-from date filter for UI display (DB still gets all emails for NLP)
+          // Apply sync-from date filter for UI display
           const displayEmails = _syncFromDate
             ? emails.filter(e => {
                 if (!e.sentAt) return true;
@@ -1115,23 +1194,21 @@ async function runThunderbirdSync() {
               })
             : emails;
 
-          // Persist ALL emails to SQLite (NLP processes everything)
-          if (pythonAvailable) {
-            persistEmailsToDB(emails, syncKey).catch(() => {});
-          }
+          // Persist ALL to SQLite
+          if (pythonAvailable) persistEmailsToDB(emails, syncKey).catch(() => {});
           // Queue ALL for NLP
-          if (pythonAvailable) {
-            queueEmailsForBackgroundNLP(emails).catch(() => {});
-          }
+          if (pythonAvailable) queueEmailsForBackgroundNLP(emails).catch(() => {});
           // Send date-filtered emails to renderer for UI display
-          mainWindow.webContents.send('thunderbird:folderUpdate', {
-            syncKey,
-            emails: displayEmails,
-            total: displayEmails.length,
-          });
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('thunderbird:folderUpdate', {
+              syncKey,
+              emails: displayEmails,
+              total: displayEmails.length,
+            });
+          }
         }
       } catch (err) {
-        console.log('[TB-SYNC] Reload failed for %s: %s', syncKey, err.message);
+        console.log('[TB-SYNC] Reload failed for %s: %s', supplierName, err.message);
       }
     }
 
@@ -1145,8 +1222,8 @@ async function runThunderbirdSync() {
 function startAutoSync() {
   if (_autoSyncInterval) return;
   console.log('[TB-SYNC] Starting auto-sync (every 5 minutes)');
-  // First scan after 15 seconds (let renderer settle and send synced paths)
-  setTimeout(runThunderbirdSync, 15000);
+  // First scan after 2 seconds (let renderer settle)
+  setTimeout(runThunderbirdSync, 2000);
   // Then every 5 minutes
   _autoSyncInterval = setInterval(runThunderbirdSync, 5 * 60 * 1000);
 }

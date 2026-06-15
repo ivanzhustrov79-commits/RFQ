@@ -33,6 +33,7 @@ export interface Email {
 export interface Supplier { id: string; name: string; logo: string; country: string; rating: number; kpi: any; }
 export interface Rfq {
   id: string;
+  threadId?: number;
   supplierId: number;
   rfqName: string;
   rfqNameSource: 'auto' | 'ai' | 'manual';
@@ -140,8 +141,8 @@ const initialState: AppState = {
     'izhustrov@agro-pro2014.ru', 'logistic@import-detal36.ru', 'logistic@field-pro.ae',
     'yandex.com', 'pop3.field-pro.ae',
   ], suppliers: [],
-  selectedSupplierId: null, rfqs: [],
-  selectedRfqId: null, alarms: [], exceptions: [],
+  selectedSupplierId: null, rfqs: [], threads: [],
+  selectedRfqId: null, selectedThreadId: null, alarms: [], exceptions: [],
   troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null, hiddenAccounts: new Set(),
   nlpStats: { pending: 0, processing: 0, completed: 0, failed: 0 },
   rfqNames: {},
@@ -191,6 +192,8 @@ function appReducer(state: AppState, action: Action): AppState {
       return { ...state, skippedAccounts: action.payload };
     case 'SELECT_SUPPLIER': return { ...state, selectedSupplierId: action.payload };
     case 'SELECT_RFQ': return { ...state, selectedRfqId: action.payload };
+    case 'SET_THREADS': return { ...state, threads: action.payload };
+    case 'SELECT_THREAD': return { ...state, selectedThreadId: action.payload };
     case 'DISMISS_ALARM': return { ...state, alarms: state.alarms.map(a => a.id === action.payload ? { ...a, dismissed: true } : a) };
     case 'RESOLVE_EXCEPTION': return { ...state, exceptions: state.exceptions.map(e => e.id === action.payload ? { ...e, resolved: true } : e) };
     case 'ADD_CHAT_MESSAGE': return { ...state, troubleshootChat: [...state.troubleshootChat, action.payload] };
@@ -317,6 +320,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // Track which supplier IDs we've already requested a name for (avoids duplicate calls)
   const nameRequestedRef = useRef<Set<number>>(new Set());
+  const folderBufferRef = useRef<Record<string, any[]>>({});
 
   useEffect(() => {
     saveSettings(state);
@@ -418,14 +422,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     if (api.thunderbird?.onFolderUpdate) {
-      // Accumulate emails from all folders then set atomically
-      const folderBuffer: Record<string, any[]> = {};
       api.thunderbird.onFolderUpdate((data: any) => {
         if (data.emails?.length > 0) {
           const syncKey = data.syncKey || 'unknown';
-          folderBuffer[syncKey] = data.emails;
-          // Combine all buffered folder emails and set as complete state
-          const allEmails = Object.values(folderBuffer).flat();
+          folderBufferRef.current[syncKey] = data.emails;
+          const allEmails = Object.values(folderBufferRef.current).flat();
           dispatch({ type: 'SET_REAL_EMAILS', payload: allEmails });
         }
       });
@@ -444,24 +445,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     return () => { clearInterval(si); };
   }, []);
 
-  // Fetch supplier map from DB and apply to emails in state
-  useEffect(() => {
-    if (state.emails.length === 0) return;
-    const applyMap = () => {
-      fetch('http://127.0.0.1:8721/db/email-supplier-map')
-        .then(r => r.json())
-        .then(data => {
-          if (data.map && Object.keys(data.map).length > 0) {
-            dispatch({ type: 'APPLY_SUPPLIER_MAP', payload: data.map });
-          }
-        })
-        .catch(() => {});
-    };
-    applyMap();
-    // Retry after 2s in case DB is still writing during first call
-    const t = setTimeout(applyMap, 2000);
-    return () => clearTimeout(t);
-  }, [state.emails.length]);
+  // supplier map fetch removed - supplierId now set directly from folder name in main.js
 
   const getFilteredEmails = () => {
     let emails = state.emails;
@@ -469,88 +453,102 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const selectedId = Number(state.selectedSupplierId);
       emails = emails.filter(e => Number(e.supplierId) === selectedId);
     }
+    // Deduplicate by messageId (same email might be in multiple folders)
+    const seen = new Set<string>();
+    emails = emails.filter(e => {
+      if (seen.has(e.messageId)) return false;
+      seen.add(e.messageId);
+      return true;
+    });
+    // If a thread is selected, filter to only emails in that thread
+    // We match by subject prefix since React state doesn't have thread_id
+    if (state.selectedThreadId) {
+      const thread = state.threads.find((t: any) => t.id === state.selectedThreadId);
+      if (thread) {
+        const prefix = thread.subject_prefix.toLowerCase();
+        emails = emails.filter(e => {
+          const subj = (e.subject || '').toLowerCase()
+            .replace(/^(re|fwd|fw|回复|转发)[\s:：]+/gi, '').trim();
+          return subj.includes(prefix) || prefix.includes(subj.substring(0, 20));
+        });
+      }
+    }
     return emails;
   };
 
   const getSupplierKpis = (_id: string) => ({});
 
-  const getFilteredRfqs = (): Rfq[] => {
-    if (state.emails.length === 0) return [];
+  // Fetch threads from DB when supplier changes
+  useEffect(() => {
+    if (!state.selectedSupplierId) {
+      dispatch({ type: 'SET_THREADS', payload: [] });
+      return;
+    }
+    fetch(`http://127.0.0.1:8721/db/supplier/${state.selectedSupplierId}/threads`)
+      .then(r => r.json())
+      .then(d => dispatch({ type: 'SET_THREADS', payload: d.threads || [] }))
+      .catch(() => dispatch({ type: 'SET_THREADS', payload: [] }));
+  }, [state.selectedSupplierId]);
 
+  const getFilteredRfqs = (): Rfq[] => {
+    // Use DB threads if available
+    if (state.threads.length > 0) {
+      const supplier = state.suppliers.find((s: any) => s.id === state.selectedSupplierId);
+      const supplierName = supplier?.name || '';
+
+      return state.threads.map((t: any) => {
+        const storedName = state.rfqNames[`thread-${t.id}`];
+        const rfqName = storedName?.name || t.subject_prefix;
+        const rfqNameSource = storedName?.source || 'auto';
+        const maxStep = t.latest_step ?? 0;
+
+        return {
+          id: `thread-${t.id}`,
+          threadId: t.id,
+          supplierId: t.supplier_id,
+          rfqName,
+          rfqNameSource,
+          ciNumber: null,
+          status: statusFromStep(maxStep),
+          currentStep: maxStep,
+          alarmCount: 0,
+          emailCount: t.email_count,
+          enrichedCount: t.enriched_count || 0,
+          timestamp: t.last_email_at || '',
+          partNumbers: [],
+        };
+      });
+    }
+
+    // Fallback: one RFQ per supplier (old behavior, shown before threads load)
+    if (state.emails.length === 0) return [];
     const bySupplier = new Map<number, Email[]>();
     for (const e of state.emails) {
       const sid = e.supplierId || 0;
       if (!bySupplier.has(sid)) bySupplier.set(sid, []);
       bySupplier.get(sid)!.push(e);
     }
-
     const rfqs: Rfq[] = [];
     for (const [supplierId, emails] of bySupplier) {
       if (supplierId === 0) continue;
-
+      if (state.selectedSupplierId !== null && supplierId !== state.selectedSupplierId) continue;
       const rfqKey = `supplier-${supplierId}`;
       const storedName = state.rfqNames[rfqKey];
-
       const supplier = state.suppliers.find((s: any) => s.id === supplierId);
-      const supplierName = supplier?.name || emails[0]?.supplierName || `Supplier #${supplierId}`;
-
+      const supplierName = supplier?.name || `Supplier #${supplierId}`;
       const maxStep = Math.max(...emails.map(e => e.stepAssigned || 0));
-      const latestDate = emails.reduce((latest, e) => {
-        const d = e.sentAt || '';
-        return d > latest ? d : latest;
-      }, '');
-      const alarmCount = emails.filter(e => e.hasConflict || e.isLowConfidence).length;
+      const latestDate = emails.reduce((latest, e) => (e.sentAt || '') > latest ? (e.sentAt || '') : latest, '');
       const enrichedCount = emails.filter(e => e.classification && e.classification.confidence > 0).length;
-
       const partSet = new Set<string>();
-      for (const e of emails) {
-        if (e.extracted?.partNumbers) {
-          for (const p of e.extracted.partNumbers) partSet.add(p);
-        }
-      }
-
-      // ── Name resolution priority: manual > ai > rule fallback ──
+      for (const e of emails) if (e.extracted?.partNumbers) for (const p of e.extracted.partNumbers) partSet.add(p);
       let rfqName: string;
       let rfqNameSource: 'auto' | 'ai' | 'manual';
-
-      if (storedName) {
-        rfqName = storedName.name;
-        rfqNameSource = storedName.source;
-      } else {
-        // Rule-based fallback (same as before, shown while AI call is in-flight)
-        if (partSet.size > 0) {
-          rfqName = `${supplierName} — ${Array.from(partSet).slice(0, 2).join(', ')}`;
-        } else {
-          const subj = emails[0]?.subject || '';
-          rfqName = subj && subj !== '(no subject)'
-            ? `${supplierName} — ${subj.substring(0, 40)}`
-            : supplierName;
-        }
-        rfqNameSource = 'auto';
-      }
-
-      rfqs.push({
-        id: rfqKey,
-        supplierId,
-        rfqName,
-        rfqNameSource,
-        ciNumber: null,
-        status: statusFromStep(maxStep),
-        currentStep: maxStep,
-        alarmCount,
-        emailCount: emails.length,
-        enrichedCount,
-        timestamp: latestDate,
-        partNumbers: Array.from(partSet),
-      });
+      if (storedName) { rfqName = storedName.name; rfqNameSource = storedName.source; }
+      else if (partSet.size > 0) { rfqName = `${supplierName} — ${Array.from(partSet).slice(0, 2).join(', ')}`; rfqNameSource = 'auto'; }
+      else { rfqName = supplierName; rfqNameSource = 'auto'; }
+      rfqs.push({ id: rfqKey, supplierId, rfqName, rfqNameSource, ciNumber: null, status: statusFromStep(maxStep), currentStep: maxStep, alarmCount: 0, emailCount: emails.length, enrichedCount, timestamp: latestDate, partNumbers: Array.from(partSet) });
     }
-
     rfqs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-
-    if (state.selectedSupplierId !== null) {
-      return rfqs.filter(r => r.supplierId === state.selectedSupplierId);
-    }
-
     return rfqs;
   };
 

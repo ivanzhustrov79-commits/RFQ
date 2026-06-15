@@ -1,7 +1,62 @@
 // @ts-nocheck
 import { useState, useEffect } from 'react';
 import { useApp } from '@/context/AppContext';
-import { Mail, Plus, X, ChevronDown, ChevronRight, Calendar, User } from 'lucide-react';
+import { Mail, Plus, X, ChevronDown, ChevronRight, Calendar, User, Folder } from 'lucide-react';
+
+function FolderNameField({ supplier, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(supplier.folder_name_normalized || '');
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    if (!value.trim()) return;
+    setSaving(true);
+    try {
+      const res = await fetch(`http://127.0.0.1:8721/db/supplier/${supplier.id}/folder`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ folder_name: value.trim() }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setEditing(false);
+      onSaved();
+    } catch (err) {
+      console.error('[SUPPLIER] Failed to update folder:', err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (editing) {
+    return (
+      <div className="flex items-center gap-1 mb-1">
+        <input autoFocus value={value} onChange={e => setValue(e.target.value.toUpperCase())}
+          onKeyDown={e => { e.stopPropagation(); if (e.key === 'Enter') handleSave(); if (e.key === 'Escape') setEditing(false); }}
+          placeholder="FOLDER NAME"
+          className="flex-1 min-w-0 text-micro px-1.5 py-1 rounded outline-none"
+          style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--brand-plum)', color: 'var(--text-primary)', fontFamily: 'monospace' }} />
+        <button onClick={handleSave} disabled={saving} className="shrink-0 text-micro px-1.5 py-1 rounded"
+          style={{ backgroundColor: 'var(--brand-plum)', color: 'white', opacity: saving ? 0.5 : 1 }}>
+          {saving ? '…' : 'Save'}
+        </button>
+        <button onClick={() => setEditing(false)} className="shrink-0">
+          <X className="w-3 h-3" style={{ color: 'var(--text-tertiary)' }} />
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <button onClick={() => setEditing(true)}
+      className="flex items-center gap-1 mb-1 text-micro hover:opacity-80 w-full text-left"
+      style={{ color: supplier.folder_name_normalized ? 'var(--plum-accent)' : 'var(--text-tertiary)' }}>
+      <Folder className="w-3 h-3 shrink-0" />
+      <span style={{ fontFamily: 'monospace' }}>
+        {supplier.folder_name_normalized || 'Set folder name…'}
+      </span>
+    </button>
+  );
+}
 
 export function SupplierPane() {
   const { state, dispatch } = useApp();
@@ -218,6 +273,11 @@ export function SupplierPane() {
               </button>
               {isExpanded && (
                 <div className="px-3 pb-2" style={{ backgroundColor: 'rgba(0,0,0,0.15)', borderLeft: '3px solid var(--border-color)' }}>
+                  {/* Folder name */}
+                  <p className="text-micro uppercase tracking-wider pt-2 pb-1" style={S}>TB Folder</p>
+                  <FolderNameField supplier={supplier} onSaved={refreshSuppliers} />
+
+                  {/* Email patterns */}
                   <p className="text-micro uppercase tracking-wider pt-2 pb-1" style={S}>Email patterns</p>
                   {patterns.length === 0 ? <p className="text-micro italic mb-1" style={S}>None</p>
                     : patterns.map((p, i) => (

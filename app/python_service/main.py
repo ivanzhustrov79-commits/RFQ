@@ -383,6 +383,95 @@ async def add_supplier_contact(supplier_id: int, request: AddContactEmailRequest
     }
 
 
+@app.get("/db/supplier/{supplier_id}/threads")
+async def get_supplier_threads(supplier_id: int):
+    """Get all threads for a supplier with email counts."""
+    from database import get_db
+    db = await get_db()
+    rows = await db.execute("""
+        SELECT
+            t.id, t.supplier_id, t.subject_prefix,
+            COUNT(e.id) as email_count,
+            MIN(e.step_assigned) as earliest_step,
+            MAX(e.step_assigned) as latest_step,
+            MAX(e.sent_at) as last_email_at,
+            SUM(CASE WHEN e.nlp_status IN ('completed','manual') THEN 1 ELSE 0 END) as enriched_count
+        FROM threads t
+        LEFT JOIN emails e ON e.thread_id = t.id
+        WHERE t.supplier_id = ?
+        GROUP BY t.id
+        ORDER BY MAX(e.sent_at) DESC
+    """, (supplier_id,))
+    threads = await rows.fetchall()
+    return {"threads": [dict(t) for t in threads]}
+
+
+@app.get("/db/thread/{thread_id}")
+async def get_thread_detail(thread_id: int):
+    """Get emails and stats for a specific thread."""
+    from database import get_db
+    db = await get_db()
+
+    # Get emails
+    rows = await db.execute("""
+        SELECT message_id, subject, sender_email, sender_name,
+               sent_at, step_assigned, nlp_status, body_text,
+               extracted_supplier, extracted_parts
+        FROM emails
+        WHERE thread_id = ?
+        ORDER BY sent_at ASC
+    """, (thread_id,))
+    emails = await rows.fetchall()
+
+    # Get part numbers across thread
+    parts = set()
+    for e in emails:
+        if e['extracted_parts']:
+            try:
+                import json
+                p = json.loads(e['extracted_parts'])
+                if isinstance(p, list):
+                    parts.update(p)
+            except:
+                pass
+
+    # Step distribution
+    step_dist = {}
+    for e in emails:
+        step = str(e['step_assigned'] or 0)
+        step_dist[step] = step_dist.get(step, 0) + 1
+
+    return {
+        "emails": [dict(e) for e in emails],
+        "stats": {
+            "part_numbers": list(parts),
+            "step_distribution": step_dist,
+            "email_count": len(emails),
+        }
+    }
+
+
+class UpdateSupplierFolderRequest(BaseModel):
+    folder_name: str  # e.g. "NINGBO" for NINGBO COMBINE
+
+
+@app.patch("/db/supplier/{supplier_id}/folder")
+async def update_supplier_folder(supplier_id: int, request: UpdateSupplierFolderRequest):
+    """Update the Thunderbird folder name for a supplier."""
+    from database import get_db
+    db = await get_db()
+    normalized = request.folder_name.strip().upper()
+    await db.execute(
+        "UPDATE suppliers SET folder_name_normalized=?, updated_at=datetime('now') WHERE id=?",
+        (normalized, supplier_id)
+    )
+    await db.commit()
+    if db.total_changes == 0:
+        raise HTTPException(status_code=404, detail="Supplier not found")
+    logger.info("[SUPPLIER] Updated folder for supplier %d: %s", supplier_id, normalized)
+    return {"success": True, "supplier_id": supplier_id, "folder_name_normalized": normalized}
+
+
 @app.get("/db/supplier", response_model=DbSupplierResponse)
 async def db_get_supplier(domain: str = Query(..., description="Email domain")):
     """Get supplier by email domain."""

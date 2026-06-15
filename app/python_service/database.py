@@ -687,12 +687,16 @@ async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
     """List suppliers with email counts and contact patterns."""
     db = await get_db()
     cursor = await db.execute("""
-        SELECT s.id, s.name, s.email_domain, s.contact_email,
+        SELECT
+            s.id, s.name, s.email_domain, s.contact_email,
             s.folder_name_normalized, s.open_rfq_count,
-            COUNT(e.id) as total_emails,
+            COUNT(DISTINCT e.id) as total_emails,
             SUM(CASE WHEN e.nlp_status IN ('completed','manual') THEN 1 ELSE 0 END) as enriched_emails
         FROM suppliers s
-        LEFT JOIN emails e ON e.supplier_id = s.id
+        LEFT JOIN emails e ON (
+            e.supplier_id = s.id
+            OR UPPER(e.folder_path) = s.folder_name_normalized
+        )
         GROUP BY s.id ORDER BY s.name
     """)
     rows = await cursor.fetchall()
