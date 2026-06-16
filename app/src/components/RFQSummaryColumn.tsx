@@ -15,15 +15,13 @@ export function RFQSummaryColumn() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleSelectRfq = (rfq: any) => {
-    if (editingId) return;
+    if (editingId) return; // don't navigate while editing
     const isAlreadySelected = state.selectedRfqId === rfq.id;
     if (isAlreadySelected) {
       dispatch({ type: 'SELECT_RFQ', payload: null });
-      dispatch({ type: 'SELECT_THREAD', payload: null });
       dispatch({ type: 'SELECT_SUPPLIER', payload: null });
     } else {
       dispatch({ type: 'SELECT_RFQ', payload: rfq.id });
-      dispatch({ type: 'SELECT_THREAD', payload: rfq.threadId || null });
       dispatch({ type: 'SELECT_SUPPLIER', payload: rfq.supplierId });
     }
   };
@@ -51,7 +49,7 @@ export function RFQSummaryColumn() {
 
   return (
     <div
-      className="w-[200px] shrink-0 flex flex-col overflow-hidden"
+      className="w-[280px] shrink-0 flex flex-col overflow-hidden"
       style={{ backgroundColor: 'var(--dark-bg)', borderRight: '1px solid var(--border-color)' }}
     >
       <div className="px-3 py-3" style={{ borderBottom: '1px solid var(--border-color)' }}>
@@ -73,7 +71,7 @@ export function RFQSummaryColumn() {
               <button
                 key={rfq.id}
                 onClick={() => handleSelectRfq(rfq)}
-                className="w-full flex flex-col gap-1 px-3 py-2.5 text-left transition-colors duration-150"
+                className="w-full flex flex-col gap-0.5 px-3 py-2 text-left transition-colors duration-150"
                 style={{
                   backgroundColor: isSelected ? 'rgba(73,40,96,0.2)' : 'transparent',
                   borderLeft: isSelected ? '3px solid var(--brand-plum)' : '3px solid transparent',
@@ -81,21 +79,7 @@ export function RFQSummaryColumn() {
                 onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.backgroundColor = 'rgba(128,128,128,0.04)'; }}
                 onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.backgroundColor = 'transparent'; }}
               >
-                {/* Row 1: CI number / pending + alarm bell */}
-                <div className="flex items-center gap-1.5">
-                  {rfq.ciNumber ? (
-                    <span className="text-small font-mono font-medium" style={{ color: 'var(--blue-ci)' }}>
-                      {rfq.ciNumber}
-                    </span>
-                  ) : (
-                    <span className="text-small italic" style={{ color: 'var(--text-tertiary)' }}>Pending</span>
-                  )}
-                  {rfq.alarmCount > 0 && (
-                    <Bell className="w-3 h-3" style={{ color: 'var(--red-urgent)' }} />
-                  )}
-                </div>
-
-                {/* Row 2: RFQ name — editable */}
+                {/* RFQ name — editable */}
                 <div className="flex items-center gap-1 group/name w-full">
                   {isEditing ? (
                     <>
@@ -174,12 +158,9 @@ export function RFQSummaryColumn() {
                   )}
                 </div>
 
-                {/* Row 3: status badge + counts */}
+                {/* Counts row */}
                 <div className="flex items-center gap-1.5">
-                  <Badge variant={rfq.status.toLowerCase() as 'open' | 'pending' | 'approved' | 'closed'}>
-                    {rfq.status}
-                  </Badge>
-                  <span className="text-micro ml-1" style={{ color: 'var(--text-tertiary)' }}>
+                  <span className="text-micro" style={{ color: 'var(--text-tertiary)' }}>
                     {rfq.emailCount} email{rfq.emailCount !== 1 ? 's' : ''}
                   </span>
                   {rfq.enrichedCount > 0 && (

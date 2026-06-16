@@ -1,5 +1,5 @@
 // @ts-nocheck
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { X, Cpu, Hash, AlertTriangle, CheckCircle, Clock, Mail, Send } from 'lucide-react';
 import { format, parseISO, isValid } from 'date-fns';
 import type { Email } from '@/context/AppContext';
@@ -30,6 +30,20 @@ interface EmailDetailPanelProps {
 
 export function EmailDetailPanel({ email, onClose }: EmailDetailPanelProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  const [body, setBody] = useState<string | null>(null);
+  const [bodyLoading, setBodyLoading] = useState(false);
+
+  // Fetch body on demand when email changes
+  useEffect(() => {
+    if (!email?.messageId) { setBody(null); return; }
+    setBody(null);
+    setBodyLoading(true);
+    fetch(`http://127.0.0.1:8721/db/email/body/${encodeURIComponent(email.messageId)}`)
+      .then(r => r.json())
+      .then(d => setBody(d.body || ''))
+      .catch(() => setBody(''))
+      .finally(() => setBodyLoading(false));
+  }, [email?.messageId]);
 
   // Close on Escape
   useEffect(() => {
@@ -222,20 +236,13 @@ export function EmailDetailPanel({ email, onClose }: EmailDetailPanelProps) {
                 <p className="text-micro uppercase tracking-wider mb-2" style={{ color: 'var(--text-tertiary)' }}>
                   Message
                 </p>
-                {email.body ? (
-                  <pre
-                    className="text-small whitespace-pre-wrap break-words rounded-md p-3"
-                    style={{
-                      color: 'var(--text-secondary)',
-                      backgroundColor: 'var(--card-bg)',
-                      border: '1px solid var(--border-color)',
-                      fontFamily: 'inherit',
-                      lineHeight: '1.6',
-                      maxHeight: '480px',
-                      overflowY: 'auto',
-                    }}
-                  >
-                    {email.body}
+                {bodyLoading ? (
+                  <div className="flex items-center justify-center py-8 rounded-md" style={{ backgroundColor: 'var(--card-bg)', border: '1px dashed var(--border-color)' }}>
+                    <span className="text-small italic" style={{ color: 'var(--text-tertiary)' }}>Loading…</span>
+                  </div>
+                ) : body ? (
+                  <pre className="text-small whitespace-pre-wrap break-words rounded-md p-3" style={{ color: 'var(--text-secondary)', backgroundColor: 'var(--card-bg)', border: '1px solid var(--border-color)', fontFamily: 'inherit', lineHeight: '1.6', maxHeight: '480px', overflowY: 'auto' }}>
+                    {body}
                   </pre>
                 ) : (
                   <div

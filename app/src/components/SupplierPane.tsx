@@ -117,6 +117,18 @@ export function SupplierPane() {
     } catch (err) { console.error(err); } finally { setSaving(false); }
   };
 
+  const handleDeletePattern = async (supplierId, pattern) => {
+    if (!confirm(`Delete pattern "${pattern}"?`)) return;
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:8721/db/supplier/${supplierId}/contacts?pattern=${encodeURIComponent(pattern)}`,
+        { method: 'DELETE' }
+      );
+      if (!res.ok) throw new Error(await res.text());
+      await refreshSuppliers();
+    } catch (err) { console.error(err); }
+  };
+
   const handleAddSupplier = async () => {
     const name = newSupplierName.trim();
     const email = newSupplierEmail.trim().toLowerCase();
@@ -281,9 +293,16 @@ export function SupplierPane() {
                   <p className="text-micro uppercase tracking-wider pt-2 pb-1" style={S}>Email patterns</p>
                   {patterns.length === 0 ? <p className="text-micro italic mb-1" style={S}>None</p>
                     : patterns.map((p, i) => (
-                      <div key={i} className="flex items-center gap-1 mb-0.5">
+                      <div key={i} className="flex items-center gap-1 mb-0.5 group/pattern">
                         <span className="text-micro px-1 py-0.5 rounded flex-1 truncate" style={{ backgroundColor: 'rgba(107,61,139,0.2)', color: 'var(--plum-accent)', fontFamily: 'monospace' }} title={p.email_pattern}>{p.email_pattern}</span>
                         <span className="text-micro shrink-0" style={S}>{p.match_type === 'domain' ? '≈' : '='}</span>
+                        <button
+                          onClick={() => handleDeletePattern(supplier.id, p.email_pattern)}
+                          className="shrink-0 opacity-0 group-hover/pattern:opacity-100 transition-opacity hover:opacity-80"
+                          title="Delete pattern"
+                        >
+                          <X className="w-3 h-3" style={{ color: 'var(--red-urgent)' }} />
+                        </button>
                       </div>
                     ))}
                   {addingPattern === supplier.id ? (

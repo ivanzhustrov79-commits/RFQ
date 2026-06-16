@@ -1092,80 +1092,133 @@ async function runThunderbirdSync() {
 
     // Auto-discover folders to sync:
     // For each green supplier with a folder name → find its MBOX in active accounts
-    console.log('[TB-SYNC] Auto-discovering supplier folders...');
+    // Clear previous sync data before loading new — prevents memory accumulation
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('thunderbird:clearEmails');
+    }
 
-    // Fetch suppliers once
+    console.log('[TB-SYNC] Discovering emails by supplier domain (inbox+sent+folders)...');
+
+    // Fetch suppliers and contact email patterns
     let cachedSuppliers = [];
+    let supplierDomains = new Set();
+    let supplierEmails = new Set();
+    // Map: supplierId -> {domains, emails}
+    let supplierPatternMap = {};
+
     if (pythonAvailable) {
       try {
         const r = await callPython('/db/suppliers', null, 'GET');
         cachedSuppliers = r.suppliers || [];
-        console.log('[TB-SYNC] Suppliers:', cachedSuppliers.map(s => `${s.name}(${s.folder_name_normalized})`).join(', '));
-      } catch (e) {}
-    }
-
-    // Log active accounts and their folder count
-    for (const profile of (result.profiles || [])) {
-      for (const account of (profile.trees || [])) {
-        const accountName = account.name || '';
-        const accountLower = accountName.toLowerCase();
-        if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountLower)) continue;
-        console.log('[TB-SYNC] Active account:', accountName, '(%d folders)', (account.children || []).length);
+        const cp = await callPython('/db/supplier-contact-patterns', null, 'GET');
+        for (const p of (cp.patterns || [])) {
+          const sid = p.supplier_id;
+          if (!supplierPatternMap[sid]) supplierPatternMap[sid] = { domains: [], emails: [] };
+          if (p.email_pattern.startsWith('@')) {
+            const domain = p.email_pattern.slice(1).toLowerCase();
+            supplierDomains.add(domain);
+            supplierPatternMap[sid].domains.push(domain);
+          } else {
+            const email = p.email_pattern.toLowerCase();
+            supplierEmails.add(email);
+            supplierPatternMap[sid].emails.push(email);
+          }
+        }
+        console.log('[TB-SYNC] Supplier domains:', [...supplierDomains].join(', '));
+      } catch (e) {
+        console.log('[TB-SYNC] Pattern fetch error:', e.message);
       }
     }
 
-    // Build syncable folders from suppliers + profile folder structure
-    const foldersToSync = []; // [{syncKey, mboxPath, supplierId, supplierName}]
+    function extractBareEmail(raw) {
+      if (!raw) return '';
+      const m = raw.match(/<([^>]+)>/);
+      return (m ? m[1] : raw).toLowerCase().trim();
+    }
+
+    function isSupplierAddress(raw) {
+      const bare = extractBareEmail(raw);
+      if (supplierEmails.has(bare)) return true;
+      const domain = bare.split('@')[1];
+      return domain ? supplierDomains.has(domain) : false;
+    }
+
+    function getSupplierIdFromAddress(raw) {
+      const bare = extractBareEmail(raw);
+      const domain = bare.split('@')[1];
+      for (const [sid, patterns] of Object.entries(supplierPatternMap)) {
+        if (patterns.emails.includes(bare)) return Number(sid);
+        if (domain && patterns.domains.includes(domain)) return Number(sid);
+      }
+      return null;
+    }
+
+    // Build syncable folders: supplier folders + INBOX + Sent per active account
+    const foldersToSync = [];
 
     for (const profile of (result.profiles || [])) {
       for (const account of (profile.trees || [])) {
-        // Skip if account is in skipped list
         const accountName = account.name || '';
-        const accountLower = accountName.toLowerCase();
-        if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountLower)) continue;
+        if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountName.toLowerCase())) continue;
 
-        // For each green supplier, find matching folder in this account
+        function findFolderByName(children, name) {
+          for (const child of (children || [])) {
+            if ((child.name || '').toUpperCase() === name.toUpperCase()) return child;
+            const found = findFolderByName(child.children, name);
+            if (found) return found;
+          }
+          return null;
+        }
+
+        // 1. Supplier-named folders (all emails are relevant)
         for (const supplier of cachedSuppliers) {
-          // Skip suppliers with sync disabled (supplierSyncEnabled handled client-side,
-          // so we check via the supplier_sync_enabled field if it exists, else default true)
           const folderNorm = supplier.folder_name_normalized;
           if (!folderNorm) continue;
-
-          // Search account children for matching folder
-          function findFolder(children) {
-            for (const child of (children || [])) {
-              const childUpper = (child.name || '').toUpperCase();
-              // Exact match only
-              if (childUpper === folderNorm) return child;
-              // Recurse into subfolders
-              const found = findFolder(child.children);
-              if (found) return found;
-            }
-            return null;
-          }
-
-          const folderNode = findFolder(account.children);
-          if (!folderNode || !folderNode.path) continue;
-
-          const mboxPath = folderNode.path;
-          if (!fs.existsSync(mboxPath)) continue;
-
-          const syncKey = `${profile.name}/${account.name}/${mboxPath}/${folderNode.name}`;
+          const node = findFolderByName(account.children, folderNorm);
+          if (!node?.path || !fs.existsSync(node.path)) continue;
           foldersToSync.push({
-            syncKey,
-            mboxPath,
+            syncKey: `${profile.name}/${accountName}/${node.path}/supplier-folder`,
+            mboxPath: node.path,
             supplierId: supplier.id,
             supplierName: supplier.name,
-            folderName: folderNode.name,
+            folderType: 'supplier',
+            filterFn: null,
+          });
+        }
+
+        // 2. INBOX — only emails FROM a supplier address
+        const inboxNode = findFolderByName(account.children, 'INBOX') ||
+                          findFolderByName(account.children, 'Inbox');
+        if (inboxNode?.path && fs.existsSync(inboxNode.path)) {
+          foldersToSync.push({
+            syncKey: `${profile.name}/${accountName}/${inboxNode.path}/inbox`,
+            mboxPath: inboxNode.path,
+            supplierId: null,
+            supplierName: 'INBOX',
+            folderType: 'inbox',
+            filterFn: (email) => isSupplierAddress(email.from),
+          });
+        }
+
+        // 3. Sent folder — only emails TO a supplier address
+        const sentNode = findFolderByName(account.children, 'Sent') ||
+                         findFolderByName(account.children, 'Sent Messages') ||
+                         findFolderByName(account.children, `Sent-${accountName}`);
+        if (sentNode?.path && fs.existsSync(sentNode.path)) {
+          foldersToSync.push({
+            syncKey: `${profile.name}/${accountName}/${sentNode.path}/sent`,
+            mboxPath: sentNode.path,
+            supplierId: null,
+            supplierName: 'Sent',
+            folderType: 'sent',
+            filterFn: (email) => isSupplierAddress(email.to),
           });
         }
       }
     }
 
-    console.log('[TB-SYNC] Found %d supplier folders to sync: %s',
-      foldersToSync.length,
-      foldersToSync.map(f => `${f.supplierName}(${f.folderName})`).join(', ')
-    );
+    console.log('[TB-SYNC] Found %d folders to scan', foldersToSync.length);
+
 
     // Send updated synced paths to renderer for UI display
     const syncedPathsForRenderer = {};
@@ -1173,7 +1226,7 @@ async function runThunderbirdSync() {
       syncedPathsForRenderer[f.syncKey] = f.mboxPath;
     }
 
-    for (const { syncKey, mboxPath, supplierId, supplierName, folderName } of foldersToSync) {
+    for (const { syncKey, mboxPath, supplierId, supplierName, folderType, filterFn } of foldersToSync) {
       try {
         const stats = fs.statSync(mboxPath);
         if (stats.size > 500 * 1024 * 1024) {
@@ -1181,10 +1234,24 @@ async function runThunderbirdSync() {
           continue;
         }
         const content = fs.readFileSync(mboxPath, 'utf8');
-        const emails = parseMboxEmails(content, 10000);
+        let emails = parseMboxEmails(content, 10000);
+
+        // For inbox/sent: filter by supplier address match
+        if (filterFn) {
+          emails = emails.filter(filterFn);
+        }
+
         if (emails.length > 0) {
-          // Tag all emails with supplierId — already resolved from supplier record
-          for (const e of emails) e.supplierId = supplierId;
+          // Tag supplierId — from folder for supplier folders, from address for inbox/sent
+          for (const e of emails) {
+            if (supplierId) {
+              e.supplierId = supplierId;
+            } else {
+              // Resolve from sender (inbox) or recipient (sent)
+              const addressToCheck = folderType === 'sent' ? e.to : e.from;
+              e.supplierId = getSupplierIdFromAddress(addressToCheck) || 0;
+            }
+          }
 
           // Apply sync-from date filter for UI display
           const displayEmails = _syncFromDate
@@ -1196,14 +1263,16 @@ async function runThunderbirdSync() {
 
           // Persist ALL to SQLite
           if (pythonAvailable) persistEmailsToDB(emails, syncKey).catch(() => {});
-          // Queue ALL for NLP
+          // Queue supplier/self/boss emails for NLP (skip auxiliary)
           if (pythonAvailable) queueEmailsForBackgroundNLP(emails).catch(() => {});
-          // Send date-filtered emails to renderer for UI display
+          // Apply sync-from date filter for UI display — strip body, limit count
+          const displayEmailsLean = (displayEmails.length > 300 ? displayEmails.slice(-300) : displayEmails)
+            .map(e => ({ ...e, body: undefined }));
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('thunderbird:folderUpdate', {
               syncKey,
-              emails: displayEmails,
-              total: displayEmails.length,
+              emails: displayEmailsLean,
+              total: displayEmailsLean.length,
             });
           }
         }
@@ -1235,6 +1304,8 @@ function stopAutoSync() {
     console.log('[TB-SYNC] Auto-sync stopped');
   }
 }
+
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512');
 
 app.whenReady().then(async () => {
   // Check Python NLP service on startup

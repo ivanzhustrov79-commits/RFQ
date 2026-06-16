@@ -204,6 +204,38 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
             upsert_email._thread_cache[cache_key] = thread_id
             data["thread_id"] = thread_id
 
+    # Auto-resolve sender_type if not provided
+    if not data.get("sender_type") and data.get("sender_email"):
+        import re as _re
+        raw = data["sender_email"].strip()
+        m = _re.search(r'<([^>]+)>', raw)
+        bare = m.group(1).lower() if m else raw.lower()
+
+        if not hasattr(upsert_email, '_sender_cache'):
+            upsert_email._sender_cache = {}
+
+        if bare in upsert_email._sender_cache:
+            data["sender_type"] = upsert_email._sender_cache[bare]
+        else:
+            # Check trusted senders
+            ts = await db.execute(
+                "SELECT sender_type FROM trusted_senders WHERE LOWER(email)=?", (bare,)
+            )
+            ts_row = await ts.fetchone()
+            if ts_row:
+                stype = ts_row["sender_type"]
+            else:
+                # Check supplier contact emails
+                sc = await db.execute(
+                    "SELECT id FROM supplier_contact_emails WHERE LOWER(email_pattern)=? OR LOWER(email_pattern)=?",
+                    (bare, '@' + bare.split('@')[-1])
+                )
+                sc_row = await sc.fetchone()
+                stype = 'supplier' if sc_row else 'auxiliary'
+
+            upsert_email._sender_cache[bare] = stype
+            data["sender_type"] = stype
+
     # Auto-resolve supplier_id from folder_path if not provided
     # This handles emails from multiple accounts with the same supplier folder
     if not data.get("supplier_id") and data.get("folder_path"):
@@ -241,11 +273,9 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
                 sent_at = ?, body_language = ?,
                 has_attachments = ?,
                 thread_id = CASE WHEN thread_id IS NULL THEN ? ELSE thread_id END,
-                -- Only update body_text if not yet enriched (NLP needs it once)
                 body_text = CASE WHEN nlp_status IS NULL THEN ? ELSE body_text END,
-                -- Only update supplier_id if not yet resolved
                 supplier_id = CASE WHEN supplier_id IS NULL THEN ? ELSE supplier_id END,
-                -- Never overwrite step_assigned if SMART already classified it
+                sender_type = CASE WHEN sender_type IS NULL THEN ? ELSE sender_type END,
                 step_assigned = CASE WHEN nlp_status IN ('completed','manual') THEN step_assigned ELSE ? END,
                 parsed_at = datetime('now')
             WHERE message_id = ?
@@ -255,9 +285,10 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
             data.get("sent_at"), data.get("body_language"),
             1 if data.get("has_attachments") else 0,
             data.get("thread_id"),
-            data.get("body_text"),       # for body_text CASE
-            data.get("supplier_id"),     # for supplier_id CASE
-            data.get("step_assigned", 0), # for step_assigned CASE
+            data.get("body_text"),
+            data.get("supplier_id"),
+            data.get("sender_type"),
+            data.get("step_assigned", 0),
             data.get("message_id"),
         ))
         await db.commit()
@@ -269,8 +300,8 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
             profile_name, account_email, folder_path, message_id,
             subject, sender_email, sender_name, sent_at,
             body_text, body_language, has_attachments, thread_id,
-            step_assigned, rfq_id, supplier_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            step_assigned, rfq_id, supplier_id, sender_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data.get("profile_name"), data.get("account_email"), data.get("folder_path"),
         data.get("message_id"), data.get("subject"),
@@ -278,7 +309,7 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
         data.get("body_text"), data.get("body_language"),
         1 if data.get("has_attachments") else 0,
         data.get("thread_id"), data.get("step_assigned", 0),
-        data.get("rfq_id"), data.get("supplier_id"),
+        data.get("rfq_id"), data.get("supplier_id"), data.get("sender_type"),
     ))
     await db.commit()
     return {"email_id": cursor.lastrowid, "action": "inserted"}

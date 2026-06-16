@@ -383,6 +383,51 @@ async def add_supplier_contact(supplier_id: int, request: AddContactEmailRequest
     }
 
 
+@app.delete("/db/supplier/{supplier_id}/contacts")
+async def delete_supplier_contact(supplier_id: int, pattern: str):
+    """Delete a supplier contact email pattern."""
+    from database import get_db
+    db = await get_db()
+    await db.execute(
+        "DELETE FROM supplier_contact_emails WHERE supplier_id=? AND email_pattern=?",
+        (supplier_id, pattern)
+    )
+    await db.commit()
+    if db.total_changes == 0:
+        raise HTTPException(status_code=404, detail="Pattern not found")
+    # Clear upsert_email sender/supplier caches so next sync re-resolves
+    logger.info("[SUPPLIER] Deleted contact pattern '%s' from supplier %d", pattern, supplier_id)
+    return {"success": True, "deleted": pattern}
+
+
+@app.get("/db/supplier-contact-patterns")
+async def get_all_supplier_contact_patterns():
+    """Get all supplier contact email patterns for address-based matching."""
+    from database import get_db
+    db = await get_db()
+    rows = await db.execute("""
+        SELECT supplier_id, email_pattern, match_type
+        FROM supplier_contact_emails
+        ORDER BY supplier_id
+    """)
+    patterns = await rows.fetchall()
+    return {"patterns": [dict(p) for p in patterns]}
+
+
+@app.get("/db/email/body/{message_id:path}")
+async def get_email_body(message_id: str):
+    """Fetch email body on demand (not stored in React state to save memory)."""
+    from database import get_db
+    db = await get_db()
+    row = await db.execute(
+        "SELECT body_text FROM emails WHERE message_id=?", (message_id,)
+    )
+    result = await row.fetchone()
+    if not result:
+        raise HTTPException(status_code=404, detail="Email not found")
+    return {"body": result["body_text"] or ""}
+
+
 @app.get("/db/thread-count")
 async def get_thread_count():
     """Get total thread count for settings display."""

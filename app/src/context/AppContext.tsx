@@ -102,6 +102,7 @@ type Action =
   | { type: 'SET_FONT_SIZE'; payload: 'small' | 'medium' | 'big' }
   | { type: 'TOGGLE_DATA_SOURCE' }
   | { type: 'SET_REAL_EMAILS'; payload: Email[] }
+  | { type: 'CLEAR_EMAILS' }
   | { type: 'MERGE_REAL_EMAILS'; payload: Email[] }
   | { type: 'SET_THUNDERBIRD_DATA'; payload: any }
   | { type: 'TOGGLE_THUNDERBIRD_PANEL' }
@@ -154,6 +155,7 @@ function appReducer(state: AppState, action: Action): AppState {
     case 'SET_FONT_SIZE': return { ...state, fontSize: action.payload };
     case 'TOGGLE_DATA_SOURCE': return { ...state, useRealData: !state.useRealData };
     case 'SET_REAL_EMAILS': return { ...state, emails: action.payload, useRealData: true };
+    case 'CLEAR_EMAILS': return { ...state, emails: [] };
     case 'MERGE_REAL_EMAILS': {
       const existingMap = new Map(state.emails.map(e => [e.messageId, e]));
       const merged = [...state.emails];
@@ -421,6 +423,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       });
     }
 
+    if (api.thunderbird?.onClearEmails) {
+      api.thunderbird.onClearEmails(() => {
+        folderBufferRef.current = {};
+        dispatch({ type: 'CLEAR_EMAILS' });
+      });
+    }
+
     if (api.thunderbird?.onFolderUpdate) {
       api.thunderbird.onFolderUpdate((data: any) => {
         if (data.emails?.length > 0) {
@@ -449,9 +458,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // Fetch thread email IDs when thread selected
   const [threadMessageIds, setThreadMessageIds] = useState<Set<string>>(new Set());
+  const threadMessageIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     if (!state.selectedThreadId) {
+      threadMessageIdsRef.current = new Set();
       setThreadMessageIds(new Set());
       return;
     }
@@ -459,9 +470,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       .then(r => r.json())
       .then(d => {
         const ids = new Set<string>((d.emails || []).map((e: any) => e.message_id));
+        threadMessageIdsRef.current = ids;
         setThreadMessageIds(ids);
       })
-      .catch(() => setThreadMessageIds(new Set()));
+      .catch(() => {
+        threadMessageIdsRef.current = new Set();
+        setThreadMessageIds(new Set());
+      });
   }, [state.selectedThreadId]);
 
   const getFilteredEmails = () => {
@@ -564,7 +579,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const getSelectedRfqAlarms = () => state.alarms;
 
   return (
-    <AppContext.Provider value={{ state, dispatch, getFilteredEmails, getSupplierKpis, getFilteredRfqs, getSelectedRfqParts, getSelectedRfqAlarms }}>
+    <AppContext.Provider value={{ state, dispatch, getFilteredEmails, getSupplierKpis, getFilteredRfqs, getSelectedRfqParts, getSelectedRfqAlarms, threadLoaded: threadMessageIds.size }}>
       {children}
     </AppContext.Provider>
   );
