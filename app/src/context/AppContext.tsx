@@ -18,6 +18,8 @@ export interface Email {
   smartConfirmedStep: number | null;
   isLowConfidence: boolean;
   isProvisional: boolean;
+  nlpStatus?: string | null;
+  isVerified?: boolean;
   body?: string;
   extracted?: {
     supplier: string | null;
@@ -69,7 +71,7 @@ interface AppState {
   theme: 'dark' | 'light';
   fontSize: 'small' | 'medium' | 'big';
   useRealData: boolean;
-  emails: Email[];
+  emails: Email[];           // current thread emails only (from DB)
   thunderbirdData: any;
   isThunderbirdPanelOpen: boolean;
   isAlarmBoardOpen: boolean;
@@ -102,6 +104,7 @@ type Action =
   | { type: 'SET_FONT_SIZE'; payload: 'small' | 'medium' | 'big' }
   | { type: 'TOGGLE_DATA_SOURCE' }
   | { type: 'SET_REAL_EMAILS'; payload: Email[] }
+  | { type: 'SET_THREAD_EMAILS'; payload: Email[] }
   | { type: 'CLEAR_EMAILS' }
   | { type: 'MERGE_REAL_EMAILS'; payload: Email[] }
   | { type: 'SET_THUNDERBIRD_DATA'; payload: any }
@@ -155,6 +158,7 @@ function appReducer(state: AppState, action: Action): AppState {
     case 'SET_FONT_SIZE': return { ...state, fontSize: action.payload };
     case 'TOGGLE_DATA_SOURCE': return { ...state, useRealData: !state.useRealData };
     case 'SET_REAL_EMAILS': return { ...state, emails: action.payload, useRealData: true };
+    case 'SET_THREAD_EMAILS': return { ...state, emails: action.payload, useRealData: true };
     case 'CLEAR_EMAILS': return { ...state, emails: [] };
     case 'MERGE_REAL_EMAILS': {
       const existingMap = new Map(state.emails.map(e => [e.messageId, e]));
@@ -322,7 +326,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // Track which supplier IDs we've already requested a name for (avoids duplicate calls)
   const nameRequestedRef = useRef<Set<number>>(new Set());
-  const folderBufferRef = useRef<Record<string, any[]>>({});
 
   useEffect(() => {
     saveSettings(state);
@@ -424,19 +427,60 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     if (api.thunderbird?.onClearEmails) {
-      api.thunderbird.onClearEmails(() => {
-        folderBufferRef.current = {};
-        dispatch({ type: 'CLEAR_EMAILS' });
-      });
+      // Legacy handler - no longer needed but keep for compatibility
+      api.thunderbird.onClearEmails(() => {});
     }
 
     if (api.thunderbird?.onFolderUpdate) {
-      api.thunderbird.onFolderUpdate((data: any) => {
-        if (data.emails?.length > 0) {
-          const syncKey = data.syncKey || 'unknown';
-          folderBufferRef.current[syncKey] = data.emails;
-          const allEmails = Object.values(folderBufferRef.current).flat();
-          dispatch({ type: 'SET_REAL_EMAILS', payload: allEmails });
+      // Legacy handler - refresh supplier counts when notified
+      api.thunderbird.onFolderUpdate((_data: any) => {
+        fetchSuppliers();
+      });
+    }
+
+    // New: sync complete notification - refresh supplier/thread counts
+    if ((window as any).electronAPI?.thunderbird?.onSyncComplete) {
+      (window as any).electronAPI.thunderbird.onSyncComplete(() => {
+        fetchSuppliers();
+        if (state.selectedSupplierId) {
+          fetch(`http://127.0.0.1:8721/db/supplier/${state.selectedSupplierId}/threads`)
+            .then(r => r.json())
+            .then(d => dispatch({ type: 'SET_THREADS', payload: d.threads || [] }))
+            .catch(() => {});
+        }
+      });
+    }
+
+    if (api.thunderbird?.onNewEmail) {
+      // New email arrived for current thread — refresh from DB
+      api.thunderbird.onNewEmail((data: any) => {
+        if (data.threadId && data.threadId === state.selectedThreadId) {
+          fetch(`http://127.0.0.1:8721/db/thread/${data.threadId}`)
+            .then(r => r.json())
+            .then(d => {
+              const emails: Email[] = (d.emails || []).map((e: any) => ({
+                id: 0, rfqId: 0, supplierId: 0,
+                messageId: e.message_id,
+                subject: e.subject || '(no subject)',
+                senderEmail: e.sender_email || '',
+                senderName: e.sender_name || '',
+                sentAt: e.sent_at || '',
+                stepAssigned: e.step_assigned ?? 0,
+                isInternal: false, isSentByUser: false,
+                threadConfidence: 1, hasConflict: false,
+                baseSuggestedStep: null, smartConfirmedStep: null,
+                isLowConfidence: false, isProvisional: false,
+                extracted: { supplier: null, partNumbers: [] },
+                classification: { step: e.step_assigned ?? 0, confidence: 0 },
+              }));
+              dispatch({ type: 'SET_THREAD_EMAILS', payload: emails });
+            });
+        }
+        // Always refresh thread list counts
+        if (state.selectedSupplierId) {
+          fetch(`http://127.0.0.1:8721/db/supplier/${state.selectedSupplierId}/threads`)
+            .then(r => r.json())
+            .then(d => dispatch({ type: 'SET_THREADS', payload: d.threads || [] }));
         }
       });
     }
@@ -456,48 +500,57 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // supplier map fetch removed - supplierId now set directly from folder name in main.js
 
-  // Fetch thread email IDs when thread selected
-  const [threadMessageIds, setThreadMessageIds] = useState<Set<string>>(new Set());
-  const threadMessageIdsRef = useRef<Set<string>>(new Set());
-
+  // ── DB-FIRST: Load emails from DB when thread selected ──
   useEffect(() => {
     if (!state.selectedThreadId) {
-      threadMessageIdsRef.current = new Set();
-      setThreadMessageIds(new Set());
+      dispatch({ type: 'CLEAR_EMAILS' });
       return;
     }
     fetch(`http://127.0.0.1:8721/db/thread/${state.selectedThreadId}`)
       .then(r => r.json())
       .then(d => {
-        const ids = new Set<string>((d.emails || []).map((e: any) => e.message_id));
-        threadMessageIdsRef.current = ids;
-        setThreadMessageIds(ids);
+        const emails: Email[] = (d.emails || []).map((e: any) => {
+          let nlpResult: any = null;
+          try { if (e.nlp_result) nlpResult = JSON.parse(e.nlp_result); } catch {}
+          const confidence = nlpResult?.confidence ?? 0;
+          const isVerified = (e.nlp_status === 'completed' || e.nlp_status === 'manual') && confidence >= 0.85;
+          return {
+            id: 0,
+            rfqId: 0,
+            supplierId: 0,
+            messageId: e.message_id,
+            subject: e.subject || '(no subject)',
+            senderEmail: e.sender_email || '',
+            senderName: e.sender_name || '',
+            sentAt: e.sent_at || '',
+            stepAssigned: e.step_assigned ?? 0,
+            isInternal: false,
+            isSentByUser: false,
+            threadConfidence: 1,
+            hasConflict: false,
+            baseSuggestedStep: null,
+            smartConfirmedStep: null,
+            isLowConfidence: confidence > 0 && confidence < 0.85,
+            isProvisional: false,
+            nlpStatus: e.nlp_status || null,
+            isVerified,
+            extracted: {
+              supplier: nlpResult?.supplier_name || null,
+              partNumbers: nlpResult?.part_numbers || [],
+            },
+            classification: {
+              step: e.step_assigned ?? 0,
+              confidence,
+            },
+          };
+        });
+        dispatch({ type: 'SET_THREAD_EMAILS', payload: emails });
       })
-      .catch(() => {
-        threadMessageIdsRef.current = new Set();
-        setThreadMessageIds(new Set());
-      });
+      .catch(() => dispatch({ type: 'CLEAR_EMAILS' }));
   }, [state.selectedThreadId]);
 
-  const getFilteredEmails = () => {
-    let emails = state.emails;
-    if (state.selectedSupplierId !== null) {
-      const selectedId = Number(state.selectedSupplierId);
-      emails = emails.filter(e => Number(e.supplierId) === selectedId);
-    }
-    // Deduplicate by messageId
-    const seen = new Set<string>();
-    emails = emails.filter(e => {
-      if (seen.has(e.messageId)) return false;
-      seen.add(e.messageId);
-      return true;
-    });
-    // Filter by thread using DB message IDs
-    if (state.selectedThreadId && threadMessageIds.size > 0) {
-      emails = emails.filter(e => threadMessageIds.has(e.messageId));
-    }
-    return emails;
-  };
+  // Simple passthrough — emails already filtered by DB query
+  const getFilteredEmails = () => state.emails;
 
   const getSupplierKpis = (_id: string) => ({});
 
@@ -514,72 +567,35 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [state.selectedSupplierId]);
 
   const getFilteredRfqs = (): Rfq[] => {
-    // Use DB threads if available
-    if (state.threads.length > 0) {
-      const supplier = state.suppliers.find((s: any) => s.id === state.selectedSupplierId);
-      const supplierName = supplier?.name || '';
-
-      return state.threads.map((t: any) => {
-        const storedName = state.rfqNames[`thread-${t.id}`];
-        const rfqName = storedName?.name || t.subject_prefix;
-        const rfqNameSource = storedName?.source || 'auto';
-        const maxStep = t.latest_step ?? 0;
-
-        return {
-          id: `thread-${t.id}`,
-          threadId: t.id,
-          supplierId: t.supplier_id,
-          rfqName,
-          rfqNameSource,
-          ciNumber: null,
-          status: statusFromStep(maxStep),
-          currentStep: maxStep,
-          alarmCount: 0,
-          emailCount: t.email_count,
-          enrichedCount: t.enriched_count || 0,
-          timestamp: t.last_email_at || '',
-          partNumbers: [],
-        };
-      });
-    }
-
-    // Fallback: one RFQ per supplier (old behavior, shown before threads load)
-    if (state.emails.length === 0) return [];
-    const bySupplier = new Map<number, Email[]>();
-    for (const e of state.emails) {
-      const sid = e.supplierId || 0;
-      if (!bySupplier.has(sid)) bySupplier.set(sid, []);
-      bySupplier.get(sid)!.push(e);
-    }
-    const rfqs: Rfq[] = [];
-    for (const [supplierId, emails] of bySupplier) {
-      if (supplierId === 0) continue;
-      if (state.selectedSupplierId !== null && supplierId !== state.selectedSupplierId) continue;
-      const rfqKey = `supplier-${supplierId}`;
-      const storedName = state.rfqNames[rfqKey];
-      const supplier = state.suppliers.find((s: any) => s.id === supplierId);
-      const supplierName = supplier?.name || `Supplier #${supplierId}`;
-      const maxStep = Math.max(...emails.map(e => e.stepAssigned || 0));
-      const latestDate = emails.reduce((latest, e) => (e.sentAt || '') > latest ? (e.sentAt || '') : latest, '');
-      const enrichedCount = emails.filter(e => e.classification && e.classification.confidence > 0).length;
-      const partSet = new Set<string>();
-      for (const e of emails) if (e.extracted?.partNumbers) for (const p of e.extracted.partNumbers) partSet.add(p);
-      let rfqName: string;
-      let rfqNameSource: 'auto' | 'ai' | 'manual';
-      if (storedName) { rfqName = storedName.name; rfqNameSource = storedName.source; }
-      else if (partSet.size > 0) { rfqName = `${supplierName} — ${Array.from(partSet).slice(0, 2).join(', ')}`; rfqNameSource = 'auto'; }
-      else { rfqName = supplierName; rfqNameSource = 'auto'; }
-      rfqs.push({ id: rfqKey, supplierId, rfqName, rfqNameSource, ciNumber: null, status: statusFromStep(maxStep), currentStep: maxStep, alarmCount: 0, emailCount: emails.length, enrichedCount, timestamp: latestDate, partNumbers: Array.from(partSet) });
-    }
-    rfqs.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-    return rfqs;
+    // Always use DB threads — no fallback to state.emails
+    return state.threads.map((t: any) => {
+      const storedName = state.rfqNames[`thread-${t.id}`];
+      const rfqName = storedName?.name || t.subject_prefix;
+      const rfqNameSource = storedName?.source || 'auto';
+      const maxStep = t.latest_step ?? 0;
+      return {
+        id: `thread-${t.id}`,
+        threadId: t.id,
+        supplierId: t.supplier_id,
+        rfqName,
+        rfqNameSource,
+        ciNumber: null,
+        status: statusFromStep(maxStep),
+        currentStep: maxStep,
+        alarmCount: 0,
+        emailCount: t.email_count,
+        enrichedCount: t.enriched_count || 0,
+        timestamp: t.last_email_at || '',
+        partNumbers: [],
+      };
+    });
   };
 
   const getSelectedRfqParts = () => [];
   const getSelectedRfqAlarms = () => state.alarms;
 
   return (
-    <AppContext.Provider value={{ state, dispatch, getFilteredEmails, getSupplierKpis, getFilteredRfqs, getSelectedRfqParts, getSelectedRfqAlarms, threadLoaded: threadMessageIds.size }}>
+    <AppContext.Provider value={{ state, dispatch, getFilteredEmails, getSupplierKpis, getFilteredRfqs, getSelectedRfqParts, getSelectedRfqAlarms }}>
       {children}
     </AppContext.Provider>
   );

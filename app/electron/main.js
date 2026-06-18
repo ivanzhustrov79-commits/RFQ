@@ -1,4 +1,16 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
+const readline = require('readline');
+const iconv = require('iconv-lite'); // proper charset decoding (windows-1251/cp1251 etc.)
+                                       // Node's built-in Buffer.toString() only knows
+                                       // utf8/latin1/ascii/base64/hex/utf16le — NOT
+                                       // Cyrillic codepages, which caused mojibake for
+                                       // Russian-language emails declaring charset=windows-1251.
+
+// Defense-in-depth alongside the file-size/email-count caps in the sync loop:
+// raises the V8 heap ceiling so a momentary spike doesn't OOM-crash the whole app.
+// This does NOT replace the content-size guards — unbounded growth will still
+// eventually exhaust memory — it just gives more headroom for legitimate spikes.
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=6144');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -92,12 +104,13 @@ async function queueEmailsForBackgroundNLP(emails) {
 }
 
 // ── Persist emails to SQLite via Python backend ──
-// Python auto-resolves supplier_id from sender email via supplier_contact_emails table.
-async function persistEmailsToDB(emails, syncKey) {
+// meta: { folderName, accountEmail, supplierId } — explicit, not parsed from a key string.
+async function persistEmailsToDB(emails, meta = {}) {
   if (!pythonAvailable || !emails || emails.length === 0) return;
 
-  const folderName = syncKey ? syncKey.split('/').pop() || 'inbox' : 'inbox';
-  const accountEmail = syncKey ? syncKey.split('/')[0] || 'unknown' : 'unknown';
+  const folderName = meta.folderName || 'inbox';
+  const accountEmail = meta.accountEmail || 'unknown';
+  const defaultSupplierId = meta.supplierId || null;
 
   let stored = 0;
   let skipped = 0;
@@ -114,6 +127,11 @@ async function persistEmailsToDB(emails, syncKey) {
         const emailId = email.id || (email.messageId
           ? parseInt(email.messageId.replace(/\D/g, '').substring(0, 8)) || Math.floor(Math.random() * 1000000)
           : Math.floor(Math.random() * 1000000));
+
+        // Prefer the per-email supplierId tagged during the sync loop (covers
+        // inbox/sent address-based matching); fall back to the folder-level default
+        // (covers supplier-named folders); null lets Python attempt its own resolution.
+        const resolvedSupplierId = (email.supplierId || defaultSupplierId || null);
 
         await callPython('/db/email', {
           id: emailId,
@@ -132,7 +150,7 @@ async function persistEmailsToDB(emails, syncKey) {
           thread_id: email.threadId || null,
           step_assigned: email.stepAssigned || 0,
           rfq_id: null,
-          supplier_id: null,  // Python resolves from sender_email automatically
+          supplier_id: resolvedSupplierId,
         });
         stored++;
       } catch (e) {
@@ -735,6 +753,95 @@ function mergeAccountTrees(trees) {
   return result;
 }
 
+// Streaming mbox parser for arbitrarily large files. Reads line-by-line via readline
+// (never holds the full file content in memory), and invokes onBatch(emails) every
+// BATCH_FLUSH_SIZE emails so the caller can persist+clear instead of accumulating
+// everything until the end. This is what makes "sync everything, regardless of size"
+// actually safe — no file-size cutoff needed since memory use stays roughly constant.
+async function parseMboxEmailsStreaming(mboxPath, onBatch, options = {}) {
+  const BATCH_FLUSH_SIZE = options.batchSize || 200;
+  const MAX_RAW_BODY_LEN = 50000; // raw MIME body capture ceiling (headers+boundaries+encoded
+                                    // content all live here pre-decode); final stored text gets
+                                    // truncated separately, AFTER decoding, in cleanMimeBody.
+
+  return new Promise((resolve, reject) => {
+    // CRITICAL: read as 'latin1', NOT 'utf8'. latin1 is a lossless 1:1 byte<->codepoint
+    // mapping — every byte survives untouched as a character code 0-255. Reading as utf8
+    // would corrupt any byte sequence that isn't valid UTF-8 (e.g. raw Windows-1251 bytes
+    // in 8bit/7bit-encoded Russian emails) BEFORE we ever get a chance to look at the
+    // message's declared charset. ASCII headers (From:, Subject:, boundaries) are
+    // identical in latin1 vs utf8, so all the line-detection logic below still works
+    // unchanged — we just convert back to a real Buffer (via Buffer.from(line,'latin1'))
+    // whenever we need the original bytes for charset-aware decoding.
+    const fileStream = fs.createReadStream(mboxPath, { encoding: 'latin1' });
+    const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+
+    let current = null;
+    let inBody = false;
+    let batch = [];
+    let totalCount = 0;
+    let pendingFlush = Promise.resolve(); // serializes onBatch calls so they don't overlap
+
+    function flushBatch() {
+      if (batch.length === 0) return;
+      const toFlush = batch;
+      batch = [];
+      // Chain onto pendingFlush so batches are processed in order, and so we can
+      // await the final flush before resolving (otherwise the last batch could be
+      // lost if the function returns before its async onBatch call completes).
+      pendingFlush = pendingFlush.then(() => onBatch(toFlush));
+    }
+
+    function pushCurrent() {
+      if (current && current.from) {
+        batch.push(finalizeEmail(current));
+        totalCount++;
+        if (batch.length >= BATCH_FLUSH_SIZE) flushBatch();
+      }
+    }
+
+    rl.on('line', (line) => {
+      if (line.startsWith('From ')) {
+        pushCurrent();
+        current = { subject: '', from: '', to: '', date: '', messageId: '', body: '', isInternal: false, isSentByUser: false };
+        inBody = false;
+        return;
+      }
+      if (!current) return;
+      if (!inBody) {
+        if (line === '' || line === '\r') { inBody = true; return; }
+        const lower = line.toLowerCase();
+        if (lower.startsWith('subject:')) current.subject = line.substring(8).trim();
+        else if (lower.startsWith('from:')) current.from = line.substring(5).trim();
+        else if (lower.startsWith('to:')) current.to = line.substring(3).trim();
+        else if (lower.startsWith('date:')) current.date = line.substring(5).trim();
+        else if (lower.startsWith('message-id:')) current.messageId = line.substring(11).trim();
+      } else {
+        // No truncation here — MIME headers/boundaries/encoding markers for this part
+        // can appear anywhere in the body section, and truncating mid-stream (especially
+        // mid-base64) produces garbage after decoding. Full body is captured; finalizeEmail's
+        // cleanMimeBody decodes it properly, THEN truncates the final plain-text result.
+        // A hard ceiling still applies to avoid unbounded memory on pathological emails.
+        if (current.body.length < MAX_RAW_BODY_LEN) current.body += line + '\n';
+      }
+    });
+
+    rl.on('close', async () => {
+      pushCurrent(); // final email in the file
+      flushBatch();  // flush whatever's left in the batch buffer
+      try {
+        await pendingFlush;
+        resolve(totalCount);
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    rl.on('error', reject);
+    fileStream.on('error', reject);
+  });
+}
+
 function parseMboxEmails(content, maxEmails) {
   const emails = [];
   const lines = content.split('\n');
@@ -759,7 +866,9 @@ function parseMboxEmails(content, maxEmails) {
       else if (lower.startsWith('date:')) current.date = line.substring(5).trim();
       else if (lower.startsWith('message-id:')) current.messageId = line.substring(11).trim();
     } else {
-      if (current.body.length < 1000) current.body += line + '\n';
+      // Same fix as the streaming parser: capture full raw body, decode properly in
+      // cleanMimeBody, truncate the final plain-text result afterward — not before.
+      if (current.body.length < 50000) current.body += line + '\n';
     }
   }
   if (current && current.from) emails.push(finalizeEmail(current));
@@ -769,12 +878,25 @@ function parseMboxEmails(content, maxEmails) {
 function finalizeEmail(e) {
   if (!e.subject) e.subject = '(no subject)';
   if (!e.from) e.from = 'Unknown';
-  // Decode RFC 2047 encoded-word sequences in headers
+  // Decode RFC 2047 encoded-word sequences in headers (=?charset?B/Q?...?=)
   e.subject = decodeEncodedWords(e.subject);
   e.from = decodeEncodedWords(e.from);
+  // For headers that AREN'T RFC2047-wrapped but still contain raw non-ASCII bytes
+  // (common: senders just put UTF-8 directly in headers without encoded-word wrapping):
+  // re-decode from the latin1-preserved byte sequence to recover proper UTF-8 text.
+  // Cheap no-op for pure-ASCII headers (round-trips identically), only matters when
+  // non-ASCII bytes are actually present.
+  if (/[\x80-\xff]/.test(e.subject)) {
+    try { e.subject = Buffer.from(e.subject, 'latin1').toString('utf8'); } catch {}
+  }
+  if (/[\x80-\xff]/.test(e.from)) {
+    try { e.from = Buffer.from(e.from, 'latin1').toString('utf8'); } catch {}
+  }
   const bosses = ['info@field-pro.ae', 'vlebedinets@agro-pro2014.ru'];
   e.isInternal = bosses.some(b => e.from.toLowerCase().includes(b));
-  e.isSentByUser = e.from.includes('izhustrov@import-detal36.ru');
+  // isSentByUser is no longer determined here — it depends on which account's mailbox
+  // this email came from, which isn't known inside finalizeEmail. The sync loop sets
+  // it per-email based on the actual account being processed.
   e.body = cleanMimeBody(e.body || '');
   e.sentAt = e.date || new Date().toISOString();
   e.senderEmail = e.from;
@@ -804,6 +926,18 @@ function finalizeEmail(e) {
 
 // Decode RFC 2047 encoded-word sequences in email headers
 // Handles =?charset?B?base64?= and =?charset?Q?quoted-printable?=
+function decodeWithCharset(bytes, charset) {
+  const normalized = (charset || 'utf-8').toLowerCase().replace(/^x-/, '');
+  try {
+    if (iconv.encodingExists(normalized)) {
+      return iconv.decode(bytes, normalized);
+    }
+  } catch {
+    // fall through to utf8 default below
+  }
+  return bytes.toString('utf8');
+}
+
 function decodeEncodedWords(str) {
   if (!str || !str.includes('=?')) return str;
   return str.replace(/=\?([^?]+)\?([BQbq])\?([^?]*)\?=/g, (match, charset, encoding, encoded) => {
@@ -811,60 +945,188 @@ function decodeEncodedWords(str) {
       if (encoding.toUpperCase() === 'B') {
         // Base64
         const bytes = Buffer.from(encoded, 'base64');
-        return bytes.toString(charset.toLowerCase().includes('utf') ? 'utf8' : 'latin1');
+        return decodeWithCharset(bytes, charset);
       } else {
-        // Quoted-printable (Q encoding)
-        const qp = encoded.replace(/_/g, ' ').replace(/=([0-9A-Fa-f]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-        return qp;
+        // Quoted-printable (Q encoding) — collect raw bytes first, THEN decode with
+        // the declared charset, instead of assuming each =XX byte is already a
+        // correct Unicode code point (that assumption is what produced mojibake
+        // for non-UTF-8 charsets like windows-1251).
+        const withSpaces = encoded.replace(/_/g, ' ');
+        const byteArr = [];
+        for (let i = 0; i < withSpaces.length; i++) {
+          if (withSpaces[i] === '=' && i + 2 < withSpaces.length) {
+            byteArr.push(parseInt(withSpaces.slice(i + 1, i + 3), 16));
+            i += 2;
+          } else {
+            byteArr.push(withSpaces.charCodeAt(i));
+          }
+        }
+        return decodeWithCharset(Buffer.from(byteArr), charset);
       }
     } catch {
       return match;
     }
   });
 }
+function decodeRfc2231Filename(str) {
+  // Decode RFC 2231 encoded filename*=UTF-8''%XX%XX sequences
+  return str.replace(/UTF-8''([^\s;]+)/gi, (_, encoded) => {
+    try { return decodeURIComponent(encoded); } catch { return encoded; }
+  });
+}
+
+function getMimeHeaderBlock(part) {
+  // Only the text up to the FIRST blank line is this part's own header block.
+  // Critical: prevents false-positive matches on nested content further down.
+  const idx = part.search(/\r?\n\r?\n/);
+  return idx >= 0 ? part.slice(0, idx) : part;
+}
+
+function extractTextPlainPart(raw, depth, usedBoundaries) {
+  // Recursively descend into multipart structures to find the real text/plain leaf.
+  // Handles multipart/mixed wrapping multipart/alternative (common nested case).
+  if (depth > 4) return null; // safety limit
+  usedBoundaries = usedBoundaries || new Set();
+
+  const boundaryMatch = raw.match(/Content-Type:\s*multipart\/[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*?boundary=["']?([^\s;"'\r\n]+)["']?/i);
+
+  if (!boundaryMatch) {
+    // Not multipart at this level — check if THIS is a text/plain leaf
+    const header = getMimeHeaderBlock(raw);
+    if (/Content-Type:\s*text\/plain/i.test(header) && !/Content-Disposition:\s*attachment/i.test(header)) {
+      return raw;
+    }
+    return null;
+  }
+
+  const boundary = boundaryMatch[1];
+  if (usedBoundaries.has(boundary)) return null; // prevent self-recursion on same boundary
+  const newUsed = new Set(usedBoundaries);
+  newUsed.add(boundary);
+
+  const escapedBoundary = boundary.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const parts = raw.split(new RegExp(`--${escapedBoundary}(?:--)?\\r?\\n`, 'g'));
+
+  for (const part of parts) {
+    if (!part.trim()) continue;
+    const header = getMimeHeaderBlock(part);
+
+    if (/Content-Disposition:\s*attachment/i.test(header)) continue;
+
+    // Skip any part that isn't text/plain or a multipart container — this catches
+    // attachments that DON'T declare Content-Disposition: attachment explicitly
+    // (some scanners/clients only set Content-Type: application/pdf + a name=
+    // parameter, no disposition header at all). Without this check, such a part's
+    // raw base64 content was leaking into the stored body text.
+    const contentTypeMatch = header.match(/Content-Type:\s*([^;\r\n]+)/i);
+    const contentType = contentTypeMatch ? contentTypeMatch[1].trim().toLowerCase() : '';
+    if (contentType && contentType !== 'text/plain' && !contentType.startsWith('multipart/')) {
+      continue;
+    }
+
+    // Direct text/plain leaf? Check ONLY this part's own header block.
+    if (/Content-Type:\s*text\/plain/i.test(header)) {
+      return part;
+    }
+    // Nested multipart (e.g. multipart/alternative inside multipart/mixed)? Recurse.
+    if (/Content-Type:\s*multipart\//i.test(header)) {
+      const nested = extractTextPlainPart(part, depth + 1, newUsed);
+      if (nested) return nested;
+    }
+  }
+
+  return null;
+}
+
 function cleanMimeBody(raw) {
   if (!raw) return '';
 
   let text = raw;
+  var encoding = '';
+  var charset = 'utf-8';
 
-  // Check for Content-Transfer-Encoding header
-  const encodingMatch = text.match(/Content-Transfer-Encoding:\s*(\S+)/i);
-  const encoding = encodingMatch ? encodingMatch[1].toLowerCase() : '';
+  const plainPart = extractTextPlainPart(raw, 0);
 
-  // If multipart, extract the text/plain part first
-  const plainMatch = text.match(/Content-Type:\s*text\/plain[^\n]*\n(?:Content-[^\n]+\n)*\n([\s\S]*?)(?=\n--|\n\nContent-Type:|\s*$)/i);
-  if (plainMatch) {
-    text = plainMatch[1];
+  if (plainPart) {
+    // Strip headers (everything up to the first blank line) from this part
+    const headerEnd = plainPart.search(/\r?\n\r?\n/);
+    text = headerEnd >= 0 ? plainPart.slice(headerEnd) : plainPart;
+
+    // Capture encoding AND charset from THIS part's headers specifically
+    const partEncodingMatch = plainPart.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+    encoding = partEncodingMatch ? partEncodingMatch[1].toLowerCase() : '';
+    const charsetMatch = plainPart.match(/charset\s*=\s*"?([\w-]+)"?/i);
+    if (charsetMatch) charset = charsetMatch[1];
+  } else if (/Content-Type:\s*multipart\//i.test(raw)) {
+    // Multipart but no text/plain leaf found anywhere (attachment-only or html-only) — bail empty
+    text = '';
   } else {
-    // Remove MIME boundary lines and Content-* headers (including multiline headers)
-    text = text.replace(/^--[^\n]+$/gm, '');
-    text = text.replace(/^Content-[^\n]+(?:\n\s+[^\n]+)*$/gim, '');
+    // Not multipart — single body, just strip headers if present
+    const encodingMatch = text.match(/Content-Transfer-Encoding:\s*(\S+)/i);
+    encoding = encodingMatch ? encodingMatch[1].toLowerCase() : '';
+    const charsetMatch = text.match(/charset\s*=\s*"?([\w-]+)"?/i);
+    if (charsetMatch) charset = charsetMatch[1];
+    const headerEnd = text.search(/\r?\n\r?\n/);
+    if (headerEnd >= 0 && /^(Content-|MIME-)/im.test(text.slice(0, headerEnd))) {
+      text = text.slice(headerEnd);
+    }
   }
 
-  // Strip any remaining boundary= parameters
-  text = text.replace(/\bboundary=["']?[^\s;"']+["']?/gi, '');
-
-  // Decode base64 if needed
+  // Decode base64 if needed, honoring the declared charset (not just UTF-8) —
+  // this fixes mojibake for Russian/other non-UTF-8 senders.
   if (encoding === 'base64') {
     try {
-      text = Buffer.from(text.replace(/\s/g, ''), 'base64').toString('utf8');
+      const rawBytes = Buffer.from(text.replace(/\s/g, ''), 'base64');
+      text = decodeWithCharset(rawBytes, charset);
     } catch (e) {
       // Fall through if base64 decode fails
+    }
+  } else if (charset && charset.toLowerCase() !== 'utf-8' && charset.toLowerCase() !== 'utf8') {
+    // Raw 8bit/7bit/unspecified body with a NON-UTF-8 declared charset (e.g. windows-1251).
+    // `text` at this point is a latin1-decoded string where each character code 0-255
+    // is exactly one original byte (that's what the latin1 file read upstream guarantees).
+    // Converting it back to a real Buffer and decoding with the declared charset is what
+    // actually fixes the mojibake — this is the missing piece that base64/QP-only handling
+    // didn't cover, since plenty of real-world Russian mail (especially older clients) sends
+    // 8bit-encoded windows-1251 text with no further encoding layer to "decode".
+    try {
+      const rawBytes = Buffer.from(text, 'latin1');
+      text = decodeWithCharset(rawBytes, charset);
+    } catch (e) {
+      // Fall through, keep text as-is if charset decode fails
+    }
+  } else {
+    // No declared charset (or explicitly utf-8): `text` is still a latin1-decoded
+    // string at this point (each char = 1 raw byte, from the upstream latin1 file
+    // read). For the common case — genuinely UTF-8 content — converting it back to
+    // a Buffer and re-decoding as utf8 recovers the original multi-byte characters
+    // correctly. This is the necessary counterpart to the latin1 read: without this
+    // step, EVERY email's body (not just non-UTF-8 ones) would display as raw
+    // codepoints instead of proper text.
+    try {
+      const rawBytes = Buffer.from(text, 'latin1');
+      text = rawBytes.toString('utf8');
+    } catch (e) {
+      // Keep as-is if this fails for any reason
     }
   }
 
   // Decode quoted-printable soft line breaks first
   text = text.replace(/=\r?\n/g, '');
-  // Decode quoted-printable =XX hex sequences as UTF-8 bytes
-  // Collect consecutive =XX sequences and decode as a UTF-8 buffer
-  text = text.replace(/((?:=[0-9A-Fa-f]{2})+)/g, (match) => {
-    const bytes = match.match(/=[0-9A-Fa-f]{2}/g).map(h => parseInt(h.slice(1), 16));
-    try {
-      return Buffer.from(bytes).toString('utf8');
-    } catch {
-      return match;
-    }
-  });
+  // Decode quoted-printable =XX hex sequences, honoring the declared charset —
+  // collect the raw byte sequence first, THEN decode as one unit (a multi-byte
+  // UTF-8 or single-byte CP1251 character can span multiple =XX groups; decoding
+  // each =XX independently as UTF-8 was the root cause of Cyrillic mojibake).
+  if (encoding === 'quoted-printable' || /=[0-9A-Fa-f]{2}/.test(text)) {
+    text = text.replace(/((?:=[0-9A-Fa-f]{2})+)/g, (match) => {
+      const bytes = match.match(/=[0-9A-Fa-f]{2}/g).map(h => parseInt(h.slice(1), 16));
+      try {
+        return decodeWithCharset(Buffer.from(bytes), charset);
+      } catch {
+        return match;
+      }
+    });
+  }
 
   // Strip <style>...</style> blocks entirely (content + tags)
   text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
@@ -883,10 +1145,26 @@ function cleanMimeBody(raw) {
                .replace(/&quot;/gi, '"');
   }
 
+  // Final safety net: strip any leftover MIME header lines that leaked through
+  text = text.replace(/^(Content-Type|Content-Disposition|Content-Transfer-Encoding|MIME-Version|name|filename\*?\d*\*?)\s*[:=][^\n]*$/gim, '');
+  // Strip leftover RFC 2231 encoded filename fragments (filename*0*=UTF-8''%XX...)
+  text = text.replace(/filename\*\d*\*?=.*$/gim, '');
+  text = text.replace(/\bUTF-8''[%0-9A-Za-z]+/g, '');
+
   // Collapse 3+ consecutive blank lines to 2
   text = text.replace(/\n{3,}/g, '\n\n');
 
-  return text.trim();
+  text = text.trim();
+
+  // Truncate the FINAL decoded plain text (not the raw pre-decode blob) — this is
+  // the fix for the base64-truncation-then-decode bug: decoding now always sees the
+  // complete encoded content, so the result is always clean text before we cut it down.
+  const MAX_FINAL_BODY_LEN = 1500;
+  if (text.length > MAX_FINAL_BODY_LEN) {
+    text = text.slice(0, MAX_FINAL_BODY_LEN) + '\n[...truncated]';
+  }
+
+  return text;
 }
 
 ipcMain.handle('thunderbird:discover', () => {
@@ -943,12 +1221,14 @@ ipcMain.handle('thunderbird:readMbox', async (_event, mboxPath, maxEmails = 100)
   try {
     const stats = fs.statSync(mboxPath);
     if (stats.size > 500 * 1024 * 1024) return { success: false, error: 'File too large (>500MB)' };
-    const content = fs.readFileSync(mboxPath, 'utf8');
+    // latin1, not utf8 — see parseMboxEmailsStreaming's comment for why. Keeps this
+    // manual-read path consistent with the main sync path's charset handling.
+    const content = fs.readFileSync(mboxPath, 'latin1');
     const emails = parseMboxEmails(content, maxEmails);
 
     // ── Queue emails for background NLP enrichment ──
     if (pythonAvailable && emails.length > 0) {
-      persistEmailsToDB(emails, mboxPath).catch(() => {});
+      persistEmailsToDB(emails, { folderName: path.basename(mboxPath), accountEmail: 'unknown' }).catch(() => {});
       queueEmailsForBackgroundNLP(emails).catch(err => {
         console.log('[NLP-QUEUE] Failed:', err.message);
       });
@@ -1091,25 +1371,20 @@ async function runThunderbirdSync() {
       result.profiles.length, missingFolders.length, Date.now() - t0);
 
     // Auto-discover folders to sync:
-    // For each green supplier with a folder name → find its MBOX in active accounts
-    // Clear previous sync data before loading new — prevents memory accumulation
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('thunderbird:clearEmails');
-    }
+    // Sync ALL folders in ALL active accounts (except junk/trash/spam), regardless of name.
+    // Supplier assignment is PURELY by sender/recipient address matching against
+    // supplier_contact_emails patterns — folder names/locations are not used for
+    // supplier attribution at all anymore. A Thunderbird folder is just a place mail
+    // happens to be filed; it carries no semantic meaning for this app.
+    console.log('[TB-SYNC] Discovering emails across all folders (excluding junk/trash)...');
 
-    console.log('[TB-SYNC] Discovering emails by supplier domain (inbox+sent+folders)...');
-
-    // Fetch suppliers and contact email patterns
-    let cachedSuppliers = [];
+    // Fetch supplier contact patterns for address-based resolution
     let supplierDomains = new Set();
     let supplierEmails = new Set();
-    // Map: supplierId -> {domains, emails}
-    let supplierPatternMap = {};
+    let supplierPatternMap = {}; // supplierId -> {domains: [], emails: []}
 
     if (pythonAvailable) {
       try {
-        const r = await callPython('/db/suppliers', null, 'GET');
-        cachedSuppliers = r.suppliers || [];
         const cp = await callPython('/db/supplier-contact-patterns', null, 'GET');
         for (const p of (cp.patterns || [])) {
           const sid = p.supplier_id;
@@ -1136,13 +1411,6 @@ async function runThunderbirdSync() {
       return (m ? m[1] : raw).toLowerCase().trim();
     }
 
-    function isSupplierAddress(raw) {
-      const bare = extractBareEmail(raw);
-      if (supplierEmails.has(bare)) return true;
-      const domain = bare.split('@')[1];
-      return domain ? supplierDomains.has(domain) : false;
-    }
-
     function getSupplierIdFromAddress(raw) {
       const bare = extractBareEmail(raw);
       const domain = bare.split('@')[1];
@@ -1153,67 +1421,51 @@ async function runThunderbirdSync() {
       return null;
     }
 
-    // Build syncable folders: supplier folders + INBOX + Sent per active account
-    const foldersToSync = [];
+    // Folder name fragments to EXCLUDE entirely (case-insensitive substring match)
+    // Covers English and Russian trash/junk/spam naming conventions, plus Gmail's
+    // special virtual folders (All Mail duplicates everything; Starred/Drafts aren't
+    // real correspondence).
+    const EXCLUDED_FOLDER_PATTERNS = [
+      'junk', 'trash', 'spam', 'garbage', 'deleted', 'draft', 'starred', 'all mail',
+      'корзина',      // trash (RU)
+      'удален',       // deleted (RU, covers удаленные/удалённые)
+      'спам',         // spam (RU)
+      'мусор',        // garbage (RU)
+      'черновик',     // drafts (RU)
+      'помечен',      // starred/flagged (RU)
+      'вся почта',    // all mail (RU, Gmail)
+    ];
 
+    function isExcludedFolder(name) {
+      const lower = (name || '').toLowerCase();
+      return EXCLUDED_FOLDER_PATTERNS.some(p => lower.includes(p));
+    }
+
+    // Recursively collect every leaf folder (one with an actual mbox file) in an account tree
+    function collectAllFolders(children, accountName, profileName, acc) {
+      for (const child of (children || [])) {
+        if (isExcludedFolder(child.name)) continue;
+        if (child.path && fs.existsSync(child.path)) {
+          acc.push({
+            syncKey: `${profileName}/${accountName}/${child.path}`,
+            mboxPath: child.path,
+            accountName,
+            folderName: child.name || 'unknown',
+          });
+        }
+        if (child.children && child.children.length) {
+          collectAllFolders(child.children, accountName, profileName, acc);
+        }
+      }
+      return acc;
+    }
+
+    const foldersToSync = [];
     for (const profile of (result.profiles || [])) {
       for (const account of (profile.trees || [])) {
         const accountName = account.name || '';
         if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountName.toLowerCase())) continue;
-
-        function findFolderByName(children, name) {
-          for (const child of (children || [])) {
-            if ((child.name || '').toUpperCase() === name.toUpperCase()) return child;
-            const found = findFolderByName(child.children, name);
-            if (found) return found;
-          }
-          return null;
-        }
-
-        // 1. Supplier-named folders (all emails are relevant)
-        for (const supplier of cachedSuppliers) {
-          const folderNorm = supplier.folder_name_normalized;
-          if (!folderNorm) continue;
-          const node = findFolderByName(account.children, folderNorm);
-          if (!node?.path || !fs.existsSync(node.path)) continue;
-          foldersToSync.push({
-            syncKey: `${profile.name}/${accountName}/${node.path}/supplier-folder`,
-            mboxPath: node.path,
-            supplierId: supplier.id,
-            supplierName: supplier.name,
-            folderType: 'supplier',
-            filterFn: null,
-          });
-        }
-
-        // 2. INBOX — only emails FROM a supplier address
-        const inboxNode = findFolderByName(account.children, 'INBOX') ||
-                          findFolderByName(account.children, 'Inbox');
-        if (inboxNode?.path && fs.existsSync(inboxNode.path)) {
-          foldersToSync.push({
-            syncKey: `${profile.name}/${accountName}/${inboxNode.path}/inbox`,
-            mboxPath: inboxNode.path,
-            supplierId: null,
-            supplierName: 'INBOX',
-            folderType: 'inbox',
-            filterFn: (email) => isSupplierAddress(email.from),
-          });
-        }
-
-        // 3. Sent folder — only emails TO a supplier address
-        const sentNode = findFolderByName(account.children, 'Sent') ||
-                         findFolderByName(account.children, 'Sent Messages') ||
-                         findFolderByName(account.children, `Sent-${accountName}`);
-        if (sentNode?.path && fs.existsSync(sentNode.path)) {
-          foldersToSync.push({
-            syncKey: `${profile.name}/${accountName}/${sentNode.path}/sent`,
-            mboxPath: sentNode.path,
-            supplierId: null,
-            supplierName: 'Sent',
-            folderType: 'sent',
-            filterFn: (email) => isSupplierAddress(email.to),
-          });
-        }
+        collectAllFolders(account.children, accountName, profile.name, foldersToSync);
       }
     }
 
@@ -1226,59 +1478,51 @@ async function runThunderbirdSync() {
       syncedPathsForRenderer[f.syncKey] = f.mboxPath;
     }
 
-    for (const { syncKey, mboxPath, supplierId, supplierName, folderType, filterFn } of foldersToSync) {
+    for (const { syncKey, mboxPath, accountName, folderName } of foldersToSync) {
       try {
         const stats = fs.statSync(mboxPath);
-        if (stats.size > 500 * 1024 * 1024) {
-          console.log('[TB-SYNC] Skipping %s: too large (%d MB)', supplierName, Math.round(stats.size/1024/1024));
-          continue;
-        }
-        const content = fs.readFileSync(mboxPath, 'utf8');
-        let emails = parseMboxEmails(content, 10000);
+        const sizeMB = Math.round(stats.size / 1024 / 1024);
 
-        // For inbox/sent: filter by supplier address match
-        if (filterFn) {
-          emails = emails.filter(filterFn);
-        }
+        const accountEmailLower = (accountName || '').toLowerCase();
 
-        if (emails.length > 0) {
-          // Tag supplierId — from folder for supplier folders, from address for inbox/sent
+        // Per-batch handler: tag supplierId, persist, queue for NLP, then let the batch
+        // be garbage collected. Memory stays roughly constant regardless of file size,
+        // since we never hold more than one batch (~200 emails) at a time.
+        async function handleBatch(emails) {
           for (const e of emails) {
-            if (supplierId) {
-              e.supplierId = supplierId;
-            } else {
-              // Resolve from sender (inbox) or recipient (sent)
-              const addressToCheck = folderType === 'sent' ? e.to : e.from;
-              e.supplierId = getSupplierIdFromAddress(addressToCheck) || 0;
-            }
+            e.isSentByUser = accountEmailLower && e.from.toLowerCase().includes(accountEmailLower);
+            const addressToCheck = e.isSentByUser ? e.to : e.from;
+            e.supplierId = getSupplierIdFromAddress(addressToCheck) || null;
           }
-
-          // Apply sync-from date filter for UI display
-          const displayEmails = _syncFromDate
-            ? emails.filter(e => {
-                if (!e.sentAt) return true;
-                return new Date(e.sentAt) >= new Date(_syncFromDate);
-              })
-            : emails;
-
-          // Persist ALL to SQLite
-          if (pythonAvailable) persistEmailsToDB(emails, syncKey).catch(() => {});
-          // Queue supplier/self/boss emails for NLP (skip auxiliary)
-          if (pythonAvailable) queueEmailsForBackgroundNLP(emails).catch(() => {});
-          // Apply sync-from date filter for UI display — strip body, limit count
-          const displayEmailsLean = (displayEmails.length > 300 ? displayEmails.slice(-300) : displayEmails)
-            .map(e => ({ ...e, body: undefined }));
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('thunderbird:folderUpdate', {
-              syncKey,
-              emails: displayEmailsLean,
-              total: displayEmailsLean.length,
-            });
+          if (pythonAvailable) {
+            await persistEmailsToDB(emails, {
+              folderName,
+              accountEmail: accountName,
+              supplierId: null,
+            }).catch(() => {});
+            await queueEmailsForBackgroundNLP(emails).catch(() => {});
           }
+          emails.length = 0; // explicit cleanup hint
+        }
+
+        if (sizeMB > 50) {
+          console.log('[TB-SYNC] Streaming large file: %s (%d MB)', folderName, sizeMB);
+        }
+
+        const totalProcessed = await parseMboxEmailsStreaming(mboxPath, handleBatch, { batchSize: 200 });
+        if (totalProcessed > 0) {
+          console.log('[TB-SYNC] Finished %s: %d emails processed (%d MB)', folderName, totalProcessed, sizeMB);
         }
       } catch (err) {
-        console.log('[TB-SYNC] Reload failed for %s: %s', supplierName, err.message);
+        console.log('[TB-SYNC] Sync failed for %s: %s', folderName, err.message);
       }
+    }
+
+    // Notify renderer that supplier data may have updated (just refresh counts)
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('thunderbird:syncComplete', {
+        timestamp: new Date().toISOString()
+      });
     }
 
   } catch (err) {
@@ -1291,10 +1535,10 @@ async function runThunderbirdSync() {
 function startAutoSync() {
   if (_autoSyncInterval) return;
   console.log('[TB-SYNC] Starting auto-sync (every 5 minutes)');
-  // First scan after 2 seconds (let renderer settle)
-  setTimeout(runThunderbirdSync, 2000);
-  // Then every 5 minutes
-  _autoSyncInterval = setInterval(runThunderbirdSync, 5 * 60 * 1000);
+  // First scan after 5 seconds (let renderer settle)
+  setTimeout(runThunderbirdSync, 5000);
+  // Then every 30 minutes — MBOX files don't change that frequently
+  _autoSyncInterval = setInterval(runThunderbirdSync, 30 * 60 * 1000);
 }
 
 function stopAutoSync() {
@@ -1304,8 +1548,6 @@ function stopAutoSync() {
     console.log('[TB-SYNC] Auto-sync stopped');
   }
 }
-
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512');
 
 app.whenReady().then(async () => {
   // Check Python NLP service on startup

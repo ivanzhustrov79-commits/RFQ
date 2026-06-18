@@ -1,10 +1,11 @@
 """RFQ Flow Python Service - FastAPI Application"""
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, List
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -395,9 +396,20 @@ async def delete_supplier_contact(supplier_id: int, pattern: str):
     await db.commit()
     if db.total_changes == 0:
         raise HTTPException(status_code=404, detail="Pattern not found")
-    # Clear upsert_email sender/supplier caches so next sync re-resolves
+    from database import _invalidate_email_caches
+    _invalidate_email_caches()
     logger.info("[SUPPLIER] Deleted contact pattern '%s' from supplier %d", pattern, supplier_id)
     return {"success": True, "deleted": pattern}
+
+
+@app.post("/db/clear-caches")
+async def clear_email_caches():
+    """Manually clear upsert_email's thread/sender resolution caches. Use after any
+    bulk data correction (supplier repair, thread cleanup) to guarantee fresh resolution
+    on the next sync, without needing to restart the Python service."""
+    from database import _invalidate_email_caches
+    _invalidate_email_caches()
+    return {"success": True, "message": "Caches cleared"}
 
 
 @app.get("/db/supplier-contact-patterns")
@@ -428,6 +440,239 @@ async def get_email_body(message_id: str):
     return {"body": result["body_text"] or ""}
 
 
+# ── BOOST API endpoints ───────────────────────────────────────────────────────
+
+class BoostConfigRequest(BaseModel):
+    provider: str = "kimi"  # kimi | deepseek | qwen
+    api_key: str
+
+
+@app.post("/ai/boost/config")
+async def configure_boost(request: BoostConfigRequest):
+    """Configure BOOST API provider and key."""
+    from ai.boost_client import set_provider
+    set_provider(request.provider, request.api_key)
+    return {"success": True, "provider": request.provider}
+
+
+@app.get("/ai/boost/status")
+async def boost_status():
+    """Check if BOOST API is configured."""
+    from ai.boost_client import is_configured, ACTIVE_PROVIDER, PROVIDERS
+    return {
+        "configured": is_configured(),
+        "provider": ACTIVE_PROVIDER,
+        "provider_name": PROVIDERS.get(ACTIVE_PROVIDER, {}).get("name", "Unknown"),
+    }
+
+
+BOOST_MAX_EMAILS_PER_REQUEST = 15  # cap per-click API cost regardless of trigger source
+
+
+async def _save_boost_results(db, results: list) -> int:
+    """Shared save+learn logic for BOOST results, used by both thread-level and
+    selection-level verification endpoints."""
+    from ai.rule_engine import record_correction
+    import re as _re
+
+    updated = 0
+    for r in results:
+        mid = r.get("message_id")
+        step = r.get("step", 0)
+        confidence = r.get("confidence", 0.0)
+        parts = r.get("part_numbers", [])
+        supplier = r.get("supplier_name")
+        reason = r.get("reason", "")
+        is_significant = r.get("is_significant", True)
+        significance_confidence = r.get("significance_confidence", 0.5)
+
+        if not mid:
+            continue
+
+        old_row = await db.execute(
+            "SELECT step_assigned, supplier_id, subject, is_significant FROM emails WHERE message_id=?", (mid,)
+        )
+        old_email = await old_row.fetchone()
+        old_step = old_email["step_assigned"] if old_email else None
+        old_significant = old_email["is_significant"] if old_email else None
+        supplier_id = old_email["supplier_id"] if old_email else None
+
+        basis_text = f"{old_email['subject'] if old_email else ''} {reason}".lower()
+        keywords = list(set(w for w in _re.findall(r'[a-zа-я0-9]{4,}', basis_text)))[:8]
+
+        if keywords and old_step is not None and confidence >= 0.7:
+            try:
+                await record_correction(
+                    db, message_id=mid, rule_type="step_classification",
+                    action=f"step={step}", condition_keywords=keywords,
+                    supplier_id=supplier_id, old_value=str(old_step), new_value=str(step),
+                    source="boost_api", reason=reason,
+                )
+            except Exception as e:
+                logger.warning("[BOOST] Rule learning failed for %s: %s", mid, e)
+
+        # Significance is a SEPARATE judgment from step — teach it as its own rule_type
+        # so a pattern like "greeting words -> insignificant" doesn't get conflated with
+        # step-classification patterns.
+        if (keywords and old_significant is not None
+                and bool(old_significant) != bool(is_significant)
+                and significance_confidence >= 0.7):
+            try:
+                await record_correction(
+                    db, message_id=mid, rule_type="significance",
+                    action=f"is_significant={is_significant}", condition_keywords=keywords,
+                    supplier_id=supplier_id,
+                    old_value=str(int(old_significant)), new_value=str(int(is_significant)),
+                    source="boost_api", reason=reason,
+                )
+            except Exception as e:
+                logger.warning("[BOOST] Significance rule learning failed for %s: %s", mid, e)
+
+        nlp_result = json.dumps({
+            "step": step,
+            "confidence": confidence,
+            "supplier_name": supplier,
+            "part_numbers": parts,
+            "reason": reason,
+            "is_significant": is_significant,
+            "significance_confidence": significance_confidence,
+            "source": "boost",
+        })
+
+        await db.execute("""
+            UPDATE emails SET
+                step_assigned = ?,
+                nlp_status = 'manual',
+                nlp_result = ?,
+                nlp_enriched_at = datetime('now'),
+                enrichment_mode = 'boost',
+                is_significant = ?,
+                significance_confidence = ?
+            WHERE message_id = ?
+        """, (step, nlp_result, 1 if is_significant else 0, significance_confidence, mid))
+        updated += 1
+
+    await db.commit()
+    return updated
+
+
+@app.post("/ai/boost/thread/{thread_id}")
+async def boost_verify_thread(thread_id: int):
+    """Verify all emails in a thread using BOOST API (capped at BOOST_MAX_EMAILS_PER_REQUEST)."""
+    from ai.boost_client import is_configured
+    from ai.boost_pipeline import verify_thread
+    from database import get_db
+
+    if not is_configured():
+        raise HTTPException(status_code=400, detail="BOOST API not configured")
+
+    db = await get_db()
+
+    rows = await db.execute("""
+        SELECT message_id, subject, sender_email, sent_at,
+               step_assigned, body_text, nlp_result
+        FROM emails WHERE thread_id = ?
+        ORDER BY sent_at ASC
+        LIMIT ?
+    """, (thread_id, BOOST_MAX_EMAILS_PER_REQUEST))
+    emails = [dict(e) for e in await rows.fetchall()]
+
+    if not emails:
+        raise HTTPException(status_code=404, detail="Thread has no emails")
+
+    total_count_row = await db.execute("SELECT COUNT(*) as c FROM emails WHERE thread_id = ?", (thread_id,))
+    total_count = (await total_count_row.fetchone())["c"]
+    truncated = total_count > BOOST_MAX_EMAILS_PER_REQUEST
+
+    results = await verify_thread(thread_id, emails)
+    if not results:
+        raise HTTPException(status_code=500, detail="BOOST API returned no results")
+
+    updated = await _save_boost_results(db, results)
+    logger.info("[BOOST] Thread %d: updated %d/%d emails (truncated=%s)", thread_id, updated, len(results), truncated)
+
+    return {
+        "success": True,
+        "thread_id": thread_id,
+        "emails_verified": updated,
+        "truncated": truncated,
+        "total_in_thread": total_count,
+        "results": results,
+    }
+
+
+@app.post("/ai/boost/emails")
+async def boost_verify_selected_emails(message_ids: List[str]):
+    """
+    Verify a specific, user-selected set of emails (not necessarily a whole thread)
+    using BOOST API. Supports the multi-select-then-boost UI flow. Capped at
+    BOOST_MAX_EMAILS_PER_REQUEST regardless of how many were selected.
+    """
+    from ai.boost_client import is_configured
+    from ai.boost_pipeline import verify_thread
+    from database import get_db
+
+    if not is_configured():
+        raise HTTPException(status_code=400, detail="BOOST API not configured")
+    if not message_ids:
+        raise HTTPException(status_code=400, detail="No emails selected")
+
+    db = await get_db()
+
+    truncated = len(message_ids) > BOOST_MAX_EMAILS_PER_REQUEST
+    capped_ids = message_ids[:BOOST_MAX_EMAILS_PER_REQUEST]
+
+    placeholders = ",".join("?" * len(capped_ids))
+    rows = await db.execute(f"""
+        SELECT message_id, subject, sender_email, sent_at,
+               step_assigned, body_text, nlp_result, thread_id
+        FROM emails WHERE message_id IN ({placeholders})
+        ORDER BY sent_at ASC
+    """, capped_ids)
+    emails = [dict(e) for e in await rows.fetchall()]
+
+    if not emails:
+        raise HTTPException(status_code=404, detail="No matching emails found")
+
+    # Use thread_id of the first email as context label (emails may span threads,
+    # but typically a selection comes from within one thread's view)
+    thread_id = emails[0].get("thread_id")
+
+    results = await verify_thread(thread_id, emails)
+    if not results:
+        raise HTTPException(status_code=500, detail="BOOST API returned no results")
+
+    updated = await _save_boost_results(db, results)
+    logger.info("[BOOST] Selection (%d emails): updated %d (truncated=%s)", len(emails), updated, truncated)
+
+    return {
+        "success": True,
+        "emails_verified": updated,
+        "truncated": truncated,
+        "requested_count": len(message_ids),
+        "results": results,
+    }
+
+
+@app.get("/db/needs-review")
+async def get_needs_review():
+    """List threads containing emails flagged for review (low confidence or grouping ambiguity)."""
+    from database import get_db
+    db = await get_db()
+    rows = await db.execute("""
+        SELECT t.id as thread_id, t.subject_prefix, t.supplier_id, s.name as supplier_name,
+               COUNT(e.id) as review_count
+        FROM emails e
+        JOIN threads t ON t.id = e.thread_id
+        JOIN suppliers s ON s.id = t.supplier_id
+        WHERE e.needs_review = 1
+        GROUP BY t.id
+        ORDER BY review_count DESC
+    """)
+    threads = [dict(r) for r in await rows.fetchall()]
+    return {"threads": threads, "total_threads": len(threads)}
+
+
 @app.get("/db/thread-count")
 async def get_thread_count():
     """Get total thread count for settings display."""
@@ -440,12 +685,13 @@ async def get_thread_count():
 
 @app.get("/db/supplier/{supplier_id}/threads")
 async def get_supplier_threads(supplier_id: int):
-    """Get all threads for a supplier with email counts."""
+    """Get all threads for a supplier with email counts. Excludes threads merged into others."""
     from database import get_db
     db = await get_db()
     rows = await db.execute("""
         SELECT
             t.id, t.supplier_id, t.subject_prefix,
+            t.merge_status, t.merge_confidence, t.merged_into_thread_id,
             COUNT(e.id) as email_count,
             MIN(e.step_assigned) as earliest_step,
             MAX(e.step_assigned) as latest_step,
@@ -453,12 +699,157 @@ async def get_supplier_threads(supplier_id: int):
             SUM(CASE WHEN e.nlp_status IN ('completed','manual') THEN 1 ELSE 0 END) as enriched_count
         FROM threads t
         LEFT JOIN emails e ON e.thread_id = t.id
-        WHERE t.supplier_id = ?
+        WHERE t.supplier_id = ? AND t.merged_into_thread_id IS NULL
         GROUP BY t.id
         ORDER BY MAX(e.sent_at) DESC
     """, (supplier_id,))
     threads = await rows.fetchall()
     return {"threads": [dict(t) for t in threads]}
+
+
+AUTO_MERGE_THRESHOLD = 0.85   # confidence above this -> merge immediately
+SUGGEST_THRESHOLD = 0.5       # confidence above this but below auto -> suggest, place under best guess
+
+
+@app.post("/db/supplier/{supplier_id}/analyze-merges")
+async def analyze_thread_merges(supplier_id: int):
+    """
+    Compare all of a supplier's existing threads against each other to find threads that
+    are actually the same real-world RFQ, fragmented by subject-prefix grouping.
+
+    High-confidence matches (>= AUTO_MERGE_THRESHOLD) are merged immediately.
+    Medium-confidence matches (>= SUGGEST_THRESHOLD) are NOT merged, but the smaller/later
+    thread is flagged with merge_status='suggested' and merge_confidence, so the UI can
+    visually place it near its best-guess parent (yellow card) pending human/BOOST review.
+    Low-confidence / no match: left alone entirely.
+    """
+    from database import get_db
+    from ai.pipeline import compare_threads_for_merge
+    db = await get_db()
+
+    threads_rows = await db.execute("""
+        SELECT t.id, t.subject_prefix,
+               (SELECT COUNT(*) FROM emails e WHERE e.thread_id = t.id) as email_count,
+               (SELECT MIN(sent_at) FROM emails e WHERE e.thread_id = t.id) as first_sent_at
+        FROM threads t
+        WHERE t.supplier_id = ? AND t.merged_into_thread_id IS NULL
+        ORDER BY first_sent_at ASC
+    """, (supplier_id,))
+    threads = [dict(t) for t in await threads_rows.fetchall()]
+
+    if len(threads) < 2:
+        return {"compared": 0, "auto_merged": [], "suggested": [], "message": "Not enough threads to compare"}
+
+    # Fetch the opening email's subject+body for each thread (the sample we compare on)
+    thread_samples = {}
+    for t in threads:
+        sample_row = await db.execute("""
+            SELECT subject, body_text FROM emails
+            WHERE thread_id = ? ORDER BY sent_at ASC LIMIT 1
+        """, (t["id"],))
+        sample = await sample_row.fetchone()
+        thread_samples[t["id"]] = {
+            "subject": sample["subject"] if sample else t["subject_prefix"],
+            "body": (sample["body_text"] or "") if sample else "",
+        }
+
+    auto_merged = []
+    suggested = []
+    compared = 0
+    merged_ids = set()  # threads already merged away this run, skip further comparisons
+
+    # Pairwise comparison, oldest-first as the "primary" anchor in each pair
+    for i in range(len(threads)):
+        thread_a = threads[i]
+        if thread_a["id"] in merged_ids:
+            continue
+        for j in range(i + 1, len(threads)):
+            thread_b = threads[j]
+            if thread_b["id"] in merged_ids:
+                continue
+
+            compared += 1
+            result = await asyncio.to_thread(
+                compare_threads_for_merge,
+                thread_samples[thread_a["id"]]["subject"],
+                thread_samples[thread_a["id"]]["body"],
+                thread_samples[thread_b["id"]]["subject"],
+                thread_samples[thread_b["id"]]["body"],
+            )
+
+            if not result or not result.get("same_deal"):
+                continue
+
+            confidence = result.get("confidence", 0.5)
+            reason = result.get("reason", "")
+
+            if confidence >= AUTO_MERGE_THRESHOLD:
+                # Merge thread_b INTO thread_a (a is older/primary)
+                await db.execute("""
+                    UPDATE emails SET thread_id = ? WHERE thread_id = ?
+                """, (thread_a["id"], thread_b["id"]))
+                await db.execute("""
+                    UPDATE threads SET merged_into_thread_id = ?, merge_confidence = ?,
+                                        merge_status = 'auto_merged', merge_reason = ?
+                    WHERE id = ?
+                """, (thread_a["id"], confidence, reason, thread_b["id"]))
+                await db.commit()
+                merged_ids.add(thread_b["id"])
+                auto_merged.append({
+                    "merged_thread_id": thread_b["id"],
+                    "into_thread_id": thread_a["id"],
+                    "confidence": confidence,
+                    "reason": reason,
+                })
+
+            elif confidence >= SUGGEST_THRESHOLD:
+                # Don't merge — flag thread_b as a suggested match against thread_a
+                await db.execute("""
+                    UPDATE threads SET merge_confidence = ?, merge_status = 'suggested',
+                                        merge_reason = ?
+                    WHERE id = ?
+                """, (confidence, reason, thread_b["id"]))
+                await db.commit()
+                suggested.append({
+                    "thread_id": thread_b["id"],
+                    "suggested_parent_id": thread_a["id"],
+                    "confidence": confidence,
+                    "reason": reason,
+                })
+
+    return {
+        "compared": compared,
+        "auto_merged": auto_merged,
+        "suggested": suggested,
+    }
+
+
+@app.post("/db/thread/{thread_id}/confirm-merge")
+async def confirm_thread_merge(thread_id: int, target_thread_id: int):
+    """Manually confirm a suggested merge — moves all emails into the target thread."""
+    from database import get_db
+    db = await get_db()
+
+    await db.execute("UPDATE emails SET thread_id = ? WHERE thread_id = ?", (target_thread_id, thread_id))
+    await db.execute("""
+        UPDATE threads SET merged_into_thread_id = ?, merge_status = 'auto_merged'
+        WHERE id = ?
+    """, (target_thread_id, thread_id))
+    await db.commit()
+    return {"status": "merged", "thread_id": thread_id, "into": target_thread_id}
+
+
+@app.post("/db/thread/{thread_id}/reject-merge")
+async def reject_thread_merge(thread_id: int):
+    """Reject a suggested merge — clears the suggestion, thread stays independent."""
+    from database import get_db
+    db = await get_db()
+    await db.execute("""
+        UPDATE threads SET merge_status = NULL, merge_confidence = NULL, merge_reason = NULL
+        WHERE id = ?
+    """, (thread_id,))
+    await db.commit()
+    return {"status": "rejected", "thread_id": thread_id}
 
 
 @app.get("/db/thread/{thread_id}")
@@ -470,7 +861,8 @@ async def get_thread_detail(thread_id: int):
     # Get emails
     rows = await db.execute("""
         SELECT message_id, subject, sender_email, sender_name,
-               sent_at, step_assigned, nlp_status, nlp_result
+               sent_at, step_assigned, nlp_status, nlp_result,
+               is_significant, significance_confidence
         FROM emails
         WHERE thread_id = ?
         ORDER BY sent_at ASC
@@ -496,8 +888,42 @@ async def get_thread_detail(thread_id: int):
         step = str(e['step_assigned'] or 0)
         step_dist[step] = step_dist.get(step, 0) + 1
 
+    # Compute sequence position within each step: emails are already ordered by sent_at ASC,
+    # so for each (step) group, the chronologically LAST email is the "final" one — the
+    # decision point for that step — everything before it in the same step is "discussion".
+    # The very first email overall in a step is marked "opening".
+    emails_list = [dict(e) for e in emails]
+    step_groups: Dict[int, List[int]] = {}  # step -> list of indices into emails_list
+    for idx, e in enumerate(emails_list):
+        step = e['step_assigned'] or 0
+        step_groups.setdefault(step, []).append(idx)
+
+    for step, indices in step_groups.items():
+        for pos, idx in enumerate(indices):
+            if len(indices) == 1:
+                emails_list[idx]['sequence_position'] = 'final'
+            elif pos == 0:
+                emails_list[idx]['sequence_position'] = 'opening'
+            elif pos == len(indices) - 1:
+                emails_list[idx]['sequence_position'] = 'final'
+            else:
+                emails_list[idx]['sequence_position'] = 'discussion'
+
+    # Re-order for display: within each step, significant emails first (chronological
+    # among themselves), then non-significant ones (also chronological). The UI uses
+    # `is_significant` directly to render a visual gap between the two groups — no
+    # extra field needed, just sort order + the flag itself.
+    display_order = []
+    for step in sorted(step_groups.keys()):
+        indices = step_groups[step]
+        significant_idx = [i for i in indices if emails_list[i].get('is_significant', 1)]
+        noise_idx = [i for i in indices if not emails_list[i].get('is_significant', 1)]
+        display_order.extend(significant_idx + noise_idx)
+
+    emails_list = [emails_list[i] for i in display_order]
+
     return {
-        "emails": [dict(e) for e in emails],
+        "emails": emails_list,
         "stats": {
             "part_numbers": list(parts),
             "step_distribution": step_dist,
@@ -574,7 +1000,8 @@ async def nlp_extract_rfq(request: NlpExtractRequest):
     Phase 4: Uses regex + heuristics. Phase 5: Uses LLM for better accuracy.
     """
     try:
-        extracted = extract_rfq(
+        extracted = await asyncio.to_thread(
+            extract_rfq,
             subject=request.subject,
             body_text=request.body_text,
             sender_domain=request.sender_domain,
@@ -609,7 +1036,8 @@ async def nlp_classify_step(request: NlpClassifyRequest):
     Phase 4: Uses keyword heuristics. Phase 5: Uses LLM.
     """
     try:
-        classification = classify_step(
+        classification = await asyncio.to_thread(
+            classify_step,
             subject=request.subject,
             body_text=request.body_text,
             has_attachments=False,
@@ -674,21 +1102,106 @@ async def _nlp_background_worker():
             t0 = time.time()
 
             try:
-                extracted = extract_rfq(
+                extracted = await asyncio.to_thread(
+                    extract_rfq,
                     subject=email["subject"] or "",
                     body_text=email["body_text"] or "",
                     sender_domain=sender_domain,
                     body_language=email.get("body_language"),
                 )
-                classification = classify_step(
+
+                # Fetch active learned rules (from BOOST teaching loop) for this supplier
+                from ai.rule_engine import get_active_rules, format_rules_for_prompt
+                from database import get_db
+                _db = await get_db()
+                active_rules = await get_active_rules(_db, "step_classification", email.get("supplier_id"))
+                significance_rules = await get_active_rules(_db, "significance", email.get("supplier_id"))
+                rules_hint = format_rules_for_prompt(active_rules) + format_rules_for_prompt(significance_rules)
+
+                classification = await asyncio.to_thread(
+                    classify_step,
                     subject=email["subject"] or "",
                     body_text=email["body_text"] or "",
                     has_attachments=False,
                     previous_emails=None,
+                    learned_rules_hint=rules_hint,
                 )
                 dt = time.time() - t0
 
+                needs_review = classification.get("needs_review", False)
+
+                # Thread grouping suggestion — only if supplier has multiple existing threads
+                # (cheap to skip when there's nothing to compare against)
+                suggested_thread_id = None
+                grouping_confidence = None
+                if email.get("supplier_id"):
+                    threads_rows = await _db.execute("""
+                        SELECT t.id, t.subject_prefix,
+                               (SELECT COUNT(*) FROM emails e2 WHERE e2.thread_id = t.id) as email_count
+                        FROM threads t
+                        WHERE t.supplier_id = ?
+                        ORDER BY email_count DESC LIMIT 15
+                    """, (email["supplier_id"],))
+                    existing_threads = [dict(t) for t in await threads_rows.fetchall()]
+
+                    if len(existing_threads) >= 2:  # only worth asking if there's ambiguity possible
+                        from ai.pipeline import suggest_thread_grouping
+                        grouping = await asyncio.to_thread(
+                            suggest_thread_grouping,
+                            subject=email["subject"] or "",
+                            body_text=email["body_text"] or "",
+                            sender_email=email["sender_email"] or "",
+                            existing_threads=existing_threads,
+                        )
+                        if grouping and grouping["action"] == "join_existing" and grouping["thread_id"]:
+                            suggested_thread_id = grouping["thread_id"]
+                            grouping_confidence = grouping["confidence"]
+                            if grouping_confidence < 0.6:
+                                needs_review = True
+
                 # Build result
+                is_significant = classification.get("is_significant", True)
+                significance_confidence = classification.get("significance_confidence", 0.5)
+
+                current_parts = set(
+                    p.get("part_number", str(p)) if isinstance(p, dict) else str(p)
+                    for p in extracted.get("part_numbers", [])
+                )
+
+                # Cross-check significance against the thread's REFERENCE part list (the
+                # parts actually requested in step 1, or step 0 if no step-1 exists yet).
+                # This is a cheap, rule-based signal alongside qwen's own judgment:
+                # zero overlap with the reference list is a strong hint this email is
+                # side-talk, not real RFQ progress — even if qwen guessed otherwise.
+                thread_id_for_check = email.get("thread_id")
+                if thread_id_for_check and current_parts:
+                    ref_rows = await _db.execute("""
+                        SELECT nlp_result FROM emails
+                        WHERE thread_id = ? AND step_assigned IN (0, 1) AND nlp_result IS NOT NULL
+                    """, (thread_id_for_check,))
+                    reference_parts = set()
+                    for rr in await ref_rows.fetchall():
+                        try:
+                            rnlp = json.loads(rr["nlp_result"])
+                            for p in (rnlp.get("part_numbers") or []):
+                                reference_parts.add(p if isinstance(p, str) else p.get("part_number", ""))
+                        except (json.JSONDecodeError, TypeError, AttributeError):
+                            continue
+
+                    if reference_parts:
+                        overlap = current_parts & reference_parts
+                        if overlap and not is_significant:
+                            # qwen said noise, but this email mentions originally-requested
+                            # parts — override toward significant, since this heuristic is
+                            # cheap and reliable for catching qwen's false negatives here.
+                            is_significant = True
+                            significance_confidence = max(significance_confidence, 0.75)
+                        elif not overlap and is_significant and significance_confidence < 0.7:
+                            # qwen was already uncertain AND there's no part overlap —
+                            # reinforces the noise judgment rather than overriding qwen's
+                            # confident calls outright.
+                            significance_confidence = min(significance_confidence, 0.5)
+
                 result = {
                     "supplier_name": extracted.get("supplier_name"),
                     "supplier_confidence": extracted.get("supplier_name_confidence", 0),
@@ -699,19 +1212,32 @@ async def _nlp_background_worker():
                     "confidence": classification.get("confidence", 0),
                     "reason": classification.get("reason", ""),
                     "processing_time_ms": int(dt * 1000),
+                    "needs_review": needs_review,
+                    "suggested_thread_id": suggested_thread_id,
+                    "grouping_confidence": grouping_confidence,
+                    "is_significant": is_significant,
+                    "significance_confidence": significance_confidence,
                 }
 
                 await save_nlp_result(email_id, result)
-                logger.info("[BG-NLP] Email %d enriched in %.1fs: step=%d, supplier=%s, conf=%.2f",
+                await _db.execute("""
+                    UPDATE emails SET needs_review=?, suggested_thread_id=?, grouping_confidence=?,
+                                       is_significant=?, significance_confidence=?
+                    WHERE id=?
+                """, (1 if needs_review else 0, suggested_thread_id, grouping_confidence,
+                      1 if is_significant else 0, significance_confidence, email_id))
+                await _db.commit()
+
+                logger.info("[BG-NLP] Email %d enriched in %.1fs: step=%d, supplier=%s, conf=%.2f, review=%s",
                             email_id, dt, result["step"], result["supplier_name"] or "-",
-                            result["confidence"])
+                            result["confidence"], needs_review)
 
             except Exception as e:
                 logger.error("[BG-NLP] Email %d enrichment failed: %s", email_id, e)
                 await mark_nlp_failed(email_id)
 
-            # Wait 5 minutes before processing next email
-            await asyncio.sleep(300)
+            # Small breathing gap to avoid pegging CPU at 100%, not a throttle
+            await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             break

@@ -25,49 +25,98 @@ def extract_rfq_llm(subject: str, body_text: str, sender_domain: str,
     # Truncate body to keep prompt reasonable
     body_truncated = body_text[:3000] if body_text else ""
 
-    prompt = f"""You are an RFQ (Request for Quote) data extraction assistant.
-Analyze this email and extract structured data.
+    prompt = f"""You are a procurement data extraction assistant for agricultural machinery parts.
+Extract structured data from this email. Emails may be in Russian, English, or Chinese.
 
 Email Subject: {subject}
 Sender Domain: {sender_domain}
 Body:
 {body_truncated}
 
-Extract and return ONLY a JSON object with this exact structure:
+Extract and return ONLY a JSON object in this exact format. If a value is unknown, use the
+JSON literal null (not the word "null" as text, and not a placeholder description):
+
+Example of correct output:
 {{
-  "supplier_name": "company name or null",
-  "supplier_name_confidence": 0.0 to 1.0,
+  "supplier_name": "Ningbo Combine Machinery Co Ltd",
+  "supplier_name_confidence": 0.9,
+  "part_numbers": [
+    {{"part_number": "84388386", "description": "Sprocket", "quantity": 10, "currency": "USD", "unit_price": 12.5}}
+  ],
+  "rfq_name": "Combine - Sprocket Order",
+  "ci_number": "25COM8859M",
+  "detected_language": "en"
+}}
+
+Required JSON schema:
+{{
+  "supplier_name": <string company name, or JSON null if genuinely unknown>,
+  "supplier_name_confidence": <float 0.0-1.0>,
   "part_numbers": [
     {{
-      "part_number": "the part number",
-      "description": "brief description or null",
-      "quantity": integer or null,
-      "currency": "USD/EUR/null",
-      "unit_price": float or null
+      "part_number": <string>,
+      "description": <string or JSON null>,
+      "quantity": <integer or JSON null>,
+      "currency": <"USD"|"EUR"|"CNY" or JSON null>,
+      "unit_price": <float or JSON null>
     }}
   ],
-  "rfq_name": "descriptive RFQ name or null",
-  "ci_number": "commercial invoice number or null",
-  "detected_language": "en/ru/zh/etc"
+  "rfq_name": <string or JSON null>,
+  "ci_number": <string or JSON null>,
+  "detected_language": <"en"|"ru"|"zh"|"tr">
 }}
 
 Rules:
-- Part numbers are typically 6-12 digit codes or alphanumeric codes like CAT-12345
-- Supplier name is the company sending the quote, not the recipient
-- Confidence should reflect certainty (0.9 = very sure, 0.3 = guess)
+- Part numbers: alphanumeric codes, typically 6-15 characters, often containing digits
+  mixed with letters/hyphens (manufacturer part numbers, catalog numbers). Only extract
+  codes that ACTUALLY APPEAR in the email text below — never invent or use a placeholder.
+- Look for Russian: артикул, каталожный номер, номер детали
+- Supplier is the company in the email domain, not the recipient
 - If no part numbers found, return empty array
-- RFQ name should be concise: "Supplier - PartNumber" or similar"""
+- RFQ name: "Supplier - Product" format, 3-6 words
+- NEVER write the literal text "company name or null" or any placeholder text — use a real value or JSON null
+- NEVER invent example-looking codes (such as generic placeholder-style part numbers) —
+  only return codes you can verify appear verbatim in the email body above"""
 
     result = generate_json(prompt, temperature=0.1)
     if not result:
         return None
 
-    # Normalize to our model structure
+    # Sanitize: reject placeholder/instruction text the model may echo back verbatim
+    PLACEHOLDER_PATTERNS = (
+        "company name or null", "company name", "string or null", "or null",
+        "unknown", "n/a", "none", "null",
+    )
+
+    def clean_field(value):
+        if isinstance(value, str) and value.strip().lower() in PLACEHOLDER_PATTERNS:
+            return None
+        return value
+
+    supplier_name = clean_field(result.get("supplier_name"))
+    rfq_name = clean_field(result.get("rfq_name"))
+    ci_number = clean_field(result.get("ci_number"))
+
+    # Normalize to our model structure. Also verify each part number actually appears
+    # verbatim in the source email — this catches qwen hallucinating example-looking
+    # codes (like the literal "CAT-12345" that used to be in our own prompt as an
+    # illustration) regardless of WHY it hallucinated, not just that one specific string.
+    KNOWN_PROMPT_LEAK_VALUES = {"cat-12345", "84388386", "4c3115", "h931870040070"}
+    source_text_lower = (body_text or "").lower()
+
     parts = []
     for p in result.get("part_numbers", []):
+        part_num = str(p.get("part_number", "")).strip()
+        if not part_num:
+            continue
+        part_num_lower = part_num.lower()
+        if part_num_lower in KNOWN_PROMPT_LEAK_VALUES:
+            continue  # exact known leak, always reject
+        if part_num_lower not in source_text_lower:
+            continue  # not verbatim in source — likely hallucinated, skip silently
         parts.append({
-            "part_number": str(p.get("part_number", "")),
-            "description": p.get("description"),
+            "part_number": part_num,
+            "description": clean_field(p.get("description")),
             "quantity": p.get("quantity"),
             "quantity_confidence": 0.9 if p.get("quantity") else 0.0,
             "currency": p.get("currency", "USD") if p.get("unit_price") else None,
@@ -76,12 +125,12 @@ Rules:
         })
 
     return {
-        "supplier_name": result.get("supplier_name"),
-        "supplier_name_confidence": result.get("supplier_name_confidence", 0.5),
+        "supplier_name": supplier_name,
+        "supplier_name_confidence": result.get("supplier_name_confidence", 0.5) if supplier_name else 0.0,
         "part_numbers": parts,
-        "rfq_name": result.get("rfq_name"),
+        "rfq_name": rfq_name,
         "rfq_name_source": "llm",
-        "ci_number": result.get("ci_number"),
+        "ci_number": ci_number,
         "detected_language": result.get("detected_language", body_language),
         "translation": None,
     }
@@ -89,9 +138,12 @@ Rules:
 
 def classify_step_llm(subject: str, body_text: str,
                       has_attachments: bool = False,
-                      previous_emails: Optional[List[Dict]] = None) -> Optional[Dict[str, Any]]:
+                      previous_emails: Optional[List[Dict]] = None,
+                      learned_rules_hint: str = "") -> Optional[Dict[str, Any]]:
     """
     Use LLM to classify email to workflow step. Returns None if Ollama unavailable.
+    learned_rules_hint: optional text block of active learned rules (from BOOST corrections)
+    to inject into the prompt, making local classification smarter over time.
     """
     if not is_available():
         return None
@@ -103,22 +155,34 @@ def classify_step_llm(subject: str, body_text: str,
         for i, prev in enumerate(previous_emails[-3:]):
             prev_context += f"\nPrevious email {i+1}: step {prev.get('step', '?')} - {prev.get('subject', 'N/A')}"
 
-    prompt = f"""You are an RFQ workflow classifier for a procurement system. Classify this email into exactly one of these 6 steps.
+    prompt = f"""You are an RFQ workflow classifier for agricultural machinery parts procurement.
+Classify this email into one of 6 steps. The emails are from Russian/Chinese/Turkish suppliers.
 
 Workflow Steps:
-0. New / Inbox       - Unprocessed or unrelated email, no clear procurement action
-1. RFQ Sent          - Outgoing request for quote sent TO a supplier
-2. Offer Received    - Incoming price quotation or offer FROM a supplier
-3. PI Issued         - Proforma Invoice issued or received
-4. Payment Sent      - Payment instruction, bank transfer confirmation, or payment acknowledgement
-5. Delivery / Closed - Shipping confirmation, delivery note, tracking info, or order closed
+0: Purchase Request - initial inquiry (internal trigger from boss, OR our first ask to
+   supplier). NOTE: not every early email is RFQ-related — some are just informational/
+   context-setting with no real connection to a price request.
+1: RFQ Sent - we sent supplier a detailed request for prices on a specific part list
+2: RFQ Received - supplier's price/availability answer for parts not previously quoted.
+   This includes the FIRST complete answer AND any follow-up batches covering parts the
+   supplier hadn't priced yet ("still checking, will send rest") — these are still step 2,
+   NOT negotiation, because they're new pricing info, not discussion of existing prices.
+3: Negotiation - discussion SPECIFICALLY about prices/availability/quantity/substitute
+   parts that were ALREADY quoted in step 2. If this email introduces brand new parts or
+   prices never mentioned before, it's step 2, not step 3 — step 3 requires an existing
+   quote being discussed, not a fresh one.
+4: Invoice - supplier sends invoice or proforma invoice (PI), including revisions
+5: CI Approved - WE confirm acceptance of prices for a specific part list. This list
+   almost always differs from the original request (parts added/removed/changed) —
+   if multiple confirmation emails exist, the LATEST one reflects the true final list.
 
-Key signals:
-- Step 1: subject contains "RFQ", "inquiry", "request", "запрос" or email is outbound to supplier
-- Step 2: subject contains "offer", "quote", "price", "quotation", "предложение", "прайс", or email has price list attachment
-- Step 3: subject contains "PI", "proforma", "invoice", "счет", or attachment is a proforma document
-- Step 4: subject contains "payment", "transfer", "оплата", "перевод", or body mentions bank/SWIFT/wire
-- Step 5: subject contains "delivery", "shipped", "tracking", "AWB", "доставка", "отгрузка", or body mentions waybill/courier
+Russian keywords guide:
+- Step 0: запрос, расценка, запросить, КП (коммерческое предложение)
+- Step 2: прайс, цена, предложение, проформа, PF, PI, котировка
+- Step 3: переговоры, уточнение, вопрос, согласование
+- Step 4: инвойс, CI, счет, отгрузка, B/L, коносамент
+- Step 5: оплата, SWIFT, платеж, получен, доставлен, забор груза
+{learned_rules_hint}
 
 Email Subject: {subject}
 Has Attachments: {has_attachments}
@@ -127,15 +191,27 @@ Has Attachments: {has_attachments}
 Body:
 {body_truncated}
 
+Also determine: is this email SIGNIFICANT for this step, or is it NOISE? Significant means
+it substantively advances the business (contains actual prices, part lists, decisions,
+confirmations). Noise means small talk, greetings, "will check and reply later" with no
+real content, or internal chatter that happens to be in this thread but doesn't matter
+for tracking the deal.
+
 Return ONLY a JSON object:
 {{
   "suggested_step": 0-5,
-  "step_name": "human readable name from the list above",
+  "step_name": "human readable name",
   "confidence": 0.0 to 1.0,
-  "reason": "brief explanation referencing specific words found",
+  "reason": "brief explanation in English",
   "is_low_confidence": true/false,
-  "has_conflict": true/false
-}}"""
+  "has_conflict": false,
+  "needs_review": true/false,
+  "is_significant": true/false,
+  "significance_confidence": 0.0 to 1.0
+}}
+
+Set needs_review=true if: the email content is genuinely ambiguous between two steps,
+mixes multiple topics, or you are not confident which step applies."""
 
     result = generate_json(prompt, temperature=0.1)
     if not result:
@@ -145,14 +221,133 @@ Return ONLY a JSON object:
     if not isinstance(step, int) or step < 0 or step > 5:
         step = 0
 
+    confidence = result.get("confidence", 0.5)
+    needs_review = result.get("needs_review", False) or confidence < 0.6
+
     return {
         "suggested_step": step,
         "step_name": result.get("step_name", f"Step {step}"),
-        "confidence": float(result.get("confidence", 0.5)),
+        "confidence": confidence,
         "reason": result.get("reason", "LLM classification"),
         "alternative_steps": [],
-        "is_low_confidence": result.get("is_low_confidence", step == 0),
+        "is_low_confidence": result.get("is_low_confidence", False),
         "has_conflict": result.get("has_conflict", False),
+        "needs_review": needs_review,
+        "is_significant": result.get("is_significant", True),
+        "significance_confidence": result.get("significance_confidence", 0.5),
+    }
+
+
+def suggest_thread_grouping(subject: str, body_text: str, sender_email: str,
+                              existing_threads: List[Dict]) -> Optional[Dict[str, Any]]:
+    """
+    Ask qwen whether this email belongs to an existing thread (even with a different
+    subject) or should start a new RFQ thread. Helps fix subject-prefix over-splitting.
+
+    existing_threads: list of {id, subject_prefix, email_count} for this supplier.
+    Returns: {action: 'join_existing'|'new_thread', thread_id: int|None, confidence, reason}
+    """
+    if not is_available() or not existing_threads:
+        return None
+
+    body_truncated = (body_text or "")[:1500]
+
+    threads_list = "\n".join(
+        f"  Thread {t['id']}: \"{t['subject_prefix']}\" ({t['email_count']} emails)"
+        for t in existing_threads[:15]  # cap to keep prompt small
+    )
+
+    prompt = f"""You are analyzing procurement emails to determine if a new email continues
+an existing business deal (RFQ) even if the subject line is different — for example,
+an initial inquiry, a price quote, and a payment confirmation may have completely
+different subjects but are the SAME real-world deal.
+
+New email:
+Subject: {subject}
+From: {sender_email}
+Body: {body_truncated}
+
+Existing threads with this same supplier:
+{threads_list}
+
+Does this email continue one of the existing threads (different subject is OK if it's
+clearly the same deal/conversation), or is it a genuinely NEW separate request?
+
+Return ONLY a JSON object:
+{{
+  "action": "join_existing" or "new_thread",
+  "thread_id": <id of matching thread, or null if new_thread>,
+  "confidence": 0.0 to 1.0,
+  "reason": "brief explanation"
+}}"""
+
+    result = generate_json(prompt, temperature=0.1)
+    if not result:
+        return None
+
+    action = result.get("action")
+    if action not in ("join_existing", "new_thread"):
+        return None
+
+    return {
+        "action": action,
+        "thread_id": result.get("thread_id") if action == "join_existing" else None,
+        "confidence": result.get("confidence", 0.5),
+        "reason": result.get("reason", ""),
+    }
+
+
+def compare_threads_for_merge(thread_a_subject: str, thread_a_sample: str,
+                                thread_b_subject: str, thread_b_sample: str) -> Optional[Dict[str, Any]]:
+    """
+    Ask qwen whether two existing threads (each represented by their opening email)
+    are actually the SAME real-world business deal, just split by subject-prefix grouping.
+    Used for retroactive thread merging (fixing already-fragmented RFQs).
+
+    thread_a_sample / thread_b_sample: truncated body text of each thread's first email.
+    Returns: {same_deal: bool, confidence: 0.0-1.0, reason: str}
+    """
+    if not is_available():
+        return None
+
+    prompt = f"""You are analyzing two separate email threads from the same supplier to determine
+if they actually represent the SAME real-world procurement deal (RFQ), just split into
+different threads because their subject lines differ — for example, an initial inquiry,
+a price quote reply, and a payment/shipping confirmation about the same parts/order
+are the SAME deal even with totally different subjects.
+
+Thread A:
+Subject: {thread_a_subject}
+First email: {thread_a_sample[:1000]}
+
+Thread B:
+Subject: {thread_b_subject}
+First email: {thread_b_sample[:1000]}
+
+Are these the SAME business deal (same parts, same order, same conversation just
+continued under a different subject), or are they genuinely DIFFERENT/unrelated requests?
+
+Return ONLY a JSON object:
+{{
+  "same_deal": true or false,
+  "confidence": 0.0 to 1.0,
+  "reason": "brief explanation"
+}}"""
+
+    result = generate_json(prompt, temperature=0.1)
+    if not result:
+        logger.warning("[MERGE] compare_threads_for_merge got no result from generate_json "
+                        "(A=%r vs B=%r)", thread_a_subject, thread_b_subject)
+        return None
+
+    logger.info("[MERGE] Compared %r vs %r -> same_deal=%s confidence=%.2f reason=%s",
+                thread_a_subject, thread_b_subject,
+                result.get("same_deal"), result.get("confidence", 0), result.get("reason", ""))
+
+    return {
+        "same_deal": bool(result.get("same_deal", False)),
+        "confidence": result.get("confidence", 0.5),
+        "reason": result.get("reason", ""),
     }
 
 
@@ -176,12 +371,14 @@ def extract_rfq(subject: str, body_text: str, sender_domain: str,
 
 def classify_step(subject: str, body_text: str,
                   has_attachments: bool = False,
-                  previous_emails: Optional[List[Dict]] = None) -> Dict[str, Any]:
+                  previous_emails: Optional[List[Dict]] = None,
+                  learned_rules_hint: str = "") -> Dict[str, Any]:
     """
     Classify workflow step: tries LLM first, falls back to heuristics.
+    learned_rules_hint: text block of active learned rules from BOOST teaching loop.
     """
     # Try LLM first (Phase 5)
-    llm_result = classify_step_llm(subject, body_text, has_attachments, previous_emails)
+    llm_result = classify_step_llm(subject, body_text, has_attachments, previous_emails, learned_rules_hint)
     if llm_result:
         logger.info("[AI] LLM classify succeeded: step=%d %s (conf=%.2f)",
                    llm_result["suggested_step"],

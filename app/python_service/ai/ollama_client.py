@@ -8,10 +8,16 @@ from typing import Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "llama3.2"
-TIMEOUT_SECONDS = 90
+DEFAULT_MODEL = "qwen2.5:3b"
+TIMEOUT_SECONDS = 120
 
 _ollama_available: Optional[bool] = None
+
+
+def reset_availability_cache():
+    """Reset cached availability — call after changing model."""
+    global _ollama_available
+    _ollama_available = None
 
 
 def is_available() -> bool:

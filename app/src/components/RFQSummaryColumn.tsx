@@ -15,13 +15,15 @@ export function RFQSummaryColumn() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleSelectRfq = (rfq: any) => {
-    if (editingId) return; // don't navigate while editing
+    if (editingId) return;
     const isAlreadySelected = state.selectedRfqId === rfq.id;
     if (isAlreadySelected) {
       dispatch({ type: 'SELECT_RFQ', payload: null });
+      dispatch({ type: 'SELECT_THREAD', payload: null });
       dispatch({ type: 'SELECT_SUPPLIER', payload: null });
     } else {
       dispatch({ type: 'SELECT_RFQ', payload: rfq.id });
+      dispatch({ type: 'SELECT_THREAD', payload: rfq.threadId || null });
       dispatch({ type: 'SELECT_SUPPLIER', payload: rfq.supplierId });
     }
   };
@@ -164,9 +166,12 @@ export function RFQSummaryColumn() {
                     {rfq.emailCount} email{rfq.emailCount !== 1 ? 's' : ''}
                   </span>
                   {rfq.enrichedCount > 0 && (
-                    <span className="text-micro" style={{ color: 'var(--green-success)' }}>
+                    <span className="text-micro" style={{ color: rfq.enrichedCount === rfq.emailCount ? 'var(--green-success)' : 'var(--text-tertiary)' }}>
                       ({rfq.enrichedCount} AI)
                     </span>
+                  )}
+                  {rfq.enrichedCount === rfq.emailCount && rfq.emailCount > 0 && (
+                    <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: 'var(--green-success)' }} title="All emails AI verified" />
                   )}
                   <ChevronRight className="w-3 h-3 ml-auto" style={{ color: 'var(--text-tertiary)' }} />
                 </div>

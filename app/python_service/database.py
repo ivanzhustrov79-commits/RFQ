@@ -236,25 +236,11 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
             upsert_email._sender_cache[bare] = stype
             data["sender_type"] = stype
 
-    # Auto-resolve supplier_id from folder_path if not provided
-    # This handles emails from multiple accounts with the same supplier folder
-    if not data.get("supplier_id") and data.get("folder_path"):
-        if not hasattr(upsert_email, '_supplier_folder_cache'):
-            upsert_email._supplier_folder_cache = {}
-
-        folder_upper = data["folder_path"].upper()
-        if folder_upper in upsert_email._supplier_folder_cache:
-            data["supplier_id"] = upsert_email._supplier_folder_cache[folder_upper]
-        else:
-            row = await db.execute(
-                "SELECT id FROM suppliers WHERE folder_name_normalized=?",
-                (folder_upper,)
-            )
-            supplier_row = await row.fetchone()
-            supplier_id_from_folder = supplier_row["id"] if supplier_row else None
-            upsert_email._supplier_folder_cache[folder_upper] = supplier_id_from_folder
-            if supplier_id_from_folder:
-                data["supplier_id"] = supplier_id_from_folder
+    # NOTE: supplier_id is now ALWAYS resolved by Electron before calling this endpoint,
+    # purely via sender/recipient address matching against supplier_contact_emails.
+    # Folder-name-based supplier resolution has been removed entirely — folder location
+    # in the mail client carries no meaning for this app anymore. If supplier_id is still
+    # not provided (e.g. sender matched no known supplier), it stays NULL, which is correct.
 
     # Check if exists
     cursor = await db.execute(
@@ -273,7 +259,7 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
                 sent_at = ?, body_language = ?,
                 has_attachments = ?,
                 thread_id = CASE WHEN thread_id IS NULL THEN ? ELSE thread_id END,
-                body_text = CASE WHEN nlp_status IS NULL THEN ? ELSE body_text END,
+                body_text = ?,
                 supplier_id = CASE WHEN supplier_id IS NULL THEN ? ELSE supplier_id END,
                 sender_type = CASE WHEN sender_type IS NULL THEN ? ELSE sender_type END,
                 step_assigned = CASE WHEN nlp_status IN ('completed','manual') THEN step_assigned ELSE ? END,
@@ -450,10 +436,10 @@ async def get_next_nlp_pending() -> Optional[Dict[str, Any]]:
     """)
     await db.commit()
     cursor = await db.execute("""
-        SELECT id, message_id, subject, body_text, sender_email, body_language
+        SELECT id, message_id, subject, body_text, sender_email, body_language, supplier_id, thread_id
         FROM emails
         WHERE nlp_status = 'pending'
-        ORDER BY sent_at DESC
+        ORDER BY sent_at ASC
         LIMIT 1
     """)
     row = await cursor.fetchone()
@@ -673,24 +659,6 @@ async def get_supplier_emails(supplier_id: int, limit: int = 100) -> List[Dict[s
     return [dict(row) for row in rows]
 
 
-async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
-    """List all suppliers with email counts (across all mailboxes)."""
-    db = await get_db()
-    cursor = await db.execute("""
-        SELECT
-            s.id, s.name, s.email_domain, s.contact_email,
-            s.folder_name_normalized, s.open_rfq_count,
-            COUNT(e.id) as total_emails,
-            SUM(CASE WHEN e.nlp_status = 'completed' THEN 1 ELSE 0 END) as enriched_emails
-        FROM suppliers s
-        LEFT JOIN emails e ON e.supplier_id = s.id
-        GROUP BY s.id
-        ORDER BY s.name
-    """)
-    rows = await cursor.fetchall()
-    return [dict(row) for row in rows]
-
-
 async def reset_stuck_processing() -> int:
     """Reset emails stuck in 'processing' back to 'pending'. Call on startup."""
     db = await get_db()
@@ -773,6 +741,21 @@ async def get_supplier_id_by_sender(sender_email: str) -> Optional[int]:
     return row["supplier_id"] if row else None
 
 
+def _invalidate_email_caches():
+    """
+    Clear upsert_email's stale-cache risk. Must be called whenever supplier contact
+    patterns, threads, or trusted_senders change — otherwise upsert_email keeps using
+    pre-change classifications for the rest of the process lifetime (a real bug found
+    during review: these caches never expired before, silently freezing decisions made
+    before a user's correction in Settings).
+    """
+    if hasattr(upsert_email, '_thread_cache'):
+        upsert_email._thread_cache.clear()
+    if hasattr(upsert_email, '_sender_cache'):
+        upsert_email._sender_cache.clear()
+    logger.info("[CACHE] Cleared upsert_email thread/sender caches")
+
+
 async def add_supplier_contact_email(supplier_id: int, email_pattern: str, match_type: str = "address") -> bool:
     db = await get_db()
     try:
@@ -781,6 +764,7 @@ async def add_supplier_contact_email(supplier_id: int, email_pattern: str, match
             (supplier_id, email_pattern.lower(), match_type)
         )
         await db.commit()
+        _invalidate_email_caches()
         return True
     except Exception as e:
         logger.error("Failed to add contact email: %s", e)
@@ -801,15 +785,11 @@ async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
     db = await get_db()
     cursor = await db.execute("""
         SELECT
-            s.id, s.name, s.email_domain, s.contact_email,
-            s.folder_name_normalized, s.open_rfq_count,
+            s.id, s.name, s.email_domain, s.open_rfq_count,
             COUNT(DISTINCT e.id) as total_emails,
             SUM(CASE WHEN e.nlp_status IN ('completed','manual') THEN 1 ELSE 0 END) as enriched_emails
         FROM suppliers s
-        LEFT JOIN emails e ON (
-            e.supplier_id = s.id
-            OR UPPER(e.folder_path) = s.folder_name_normalized
-        )
+        LEFT JOIN emails e ON e.supplier_id = s.id
         GROUP BY s.id ORDER BY s.name
     """)
     rows = await cursor.fetchall()
@@ -821,5 +801,9 @@ async def list_suppliers_with_stats() -> List[Dict[str, Any]]:
             (d["id"],)
         )
         d["contact_patterns"] = [dict(r) for r in await ce.fetchall()]
+        # contact_email is now DERIVED from active patterns (source of truth),
+        # not the old static suppliers.contact_email column which goes stale
+        # the moment a user edits patterns in Settings.
+        d["contact_email"] = d["contact_patterns"][0]["email_pattern"] if d["contact_patterns"] else None
         result.append(d)
     return result
