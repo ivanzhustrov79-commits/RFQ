@@ -120,7 +120,19 @@ async function persistEmailsToDB(emails, meta = {}) {
   for (let i = 0; i < emails.length; i += BATCH_SIZE) {
     const batch = emails.slice(i, i + BATCH_SIZE);
     await Promise.all(batch.map(async (email) => {
-      if (!email.messageId) { skipped++; return; }
+      if (!email.messageId) {
+        skipped++;
+        // Diagnostic: log what this "skipped" email actually looks like, since we've
+        // verified parsing produces valid messageIds in isolation — this will tell us
+        // if these are genuinely different objects (e.g. from a different code path,
+        // or a stale/cached reference) reaching persistEmailsToDB with messageId lost.
+        if (skipped <= 3) {
+          console.log('[DB-PERSIST] SKIP DIAGNOSTIC: messageId=%s subject=%s from=%s keys=%s',
+            JSON.stringify(email.messageId), JSON.stringify(email.subject),
+            JSON.stringify(email.from), JSON.stringify(Object.keys(email)));
+        }
+        return;
+      }
       try {
         const senderEmail = email.senderEmail || email.from || '';
         const domain = extractDomain(email.from || senderEmail);
@@ -774,7 +786,54 @@ async function parseMboxEmailsStreaming(mboxPath, onBatch, options = {}) {
     // unchanged — we just convert back to a real Buffer (via Buffer.from(line,'latin1'))
     // whenever we need the original bytes for charset-aware decoding.
     const fileStream = fs.createReadStream(mboxPath, { encoding: 'latin1' });
-    const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
+
+    // Node's readline only recognizes \n or \r\n as line terminators — a bare \r
+    // (old Mac-style line ending, still emitted by some older mail gateways/enterprise
+    // systems) is NOT treated as a break, silently fusing two lines into one. This
+    // caused a real bug: a boundary marker line ending in bare \r got fused directly
+    // onto the next line's "Content-Type:" header with no visible separator. Fix:
+    // normalize any \r not already followed by \n into \r\n before readline sees it.
+    const { Transform } = require('stream');
+    let heldCR = false; // true if the previous chunk ended in \r that we held back
+                         // (not yet emitted) because we don't yet know if the next
+                         // chunk starts with \n (valid CRLF pair) or something else
+                         // (bare CR, needs \n inserted)
+    const crNormalizer = new Transform({
+      transform(chunk, encoding, callback) {
+        let str = chunk.toString('latin1');
+
+        if (heldCR) {
+          // Resolve the held-back \r from the previous chunk now that we can see
+          // what follows it. Either way the output starts with a valid \r\n.
+          if (str[0] === '\n') {
+            str = '\r' + str; // valid pair: emit \r then keep the \n that's already there
+          } else {
+            str = '\r\n' + str; // was bare: supply the missing \n
+          }
+          heldCR = false;
+        }
+
+        if (str.endsWith('\r')) {
+          heldCR = true;
+          str = str.slice(0, -1); // hold this \r back entirely — do not emit yet
+        }
+
+        const normalized = str.replace(/\r(?!\n)/g, '\r\n');
+        callback(null, Buffer.from(normalized, 'latin1'));
+      },
+      flush(callback) {
+        // Stream ended while a bare trailing \r was held back — it had nothing
+        // after it, so it was bare by definition; supply the missing \n.
+        if (heldCR) {
+          callback(null, Buffer.from('\r\n', 'latin1'));
+        } else {
+          callback();
+        }
+      }
+    });
+    const normalizedStream = fileStream.pipe(crNormalizer);
+
+    const rl = readline.createInterface({ input: normalizedStream, crlfDelay: Infinity });
 
     let current = null;
     let inBody = false;
@@ -794,34 +853,88 @@ async function parseMboxEmailsStreaming(mboxPath, onBatch, options = {}) {
 
     function pushCurrent() {
       if (current && current.from) {
-        batch.push(finalizeEmail(current));
+        if (global.__DIAG_PUSH_COUNT === undefined) global.__DIAG_PUSH_COUNT = 0;
+        if (global.__DIAG_PUSH_COUNT < 20) {
+          console.log('[PUSH-DIAG] About to finalize: current.messageId=%s current.subject=%s',
+            JSON.stringify(current.messageId), JSON.stringify(current.subject));
+          global.__DIAG_PUSH_COUNT++;
+        }
+        const finalized = finalizeEmail(current);
+        if (global.__DIAG_PUSH_COUNT <= 20) {
+          console.log('[PUSH-DIAG] After finalizeEmail: finalized.messageId=%s', JSON.stringify(finalized.messageId));
+        }
+        batch.push(finalized);
         totalCount++;
         if (batch.length >= BATCH_FLUSH_SIZE) flushBatch();
       }
     }
 
+    let lastHeaderField = null; // tracks which field the previous line populated, so a
+                                  // folded/continuation line (starts with whitespace per
+                                  // RFC 5322) can be appended to the right place. This is
+                                  // the actual fix: some senders (Microsoft Exchange/Outlook
+                                  // observed in practice) emit "Message-ID:" with NOTHING
+                                  // after the colon, putting the real value on the next
+                                  // line indented with leading whitespace — our parser was
+                                  // not handling this at all, silently capturing an empty
+                                  // string for any such email.
+
     rl.on('line', (line) => {
       if (line.startsWith('From ')) {
+        // Diagnostic: if the email we're ABOUT to finalize never found a Message-ID,
+        // log it now (we have full context: subject/from are already set).
+        if (current && current.from && !current.messageId) {
+          if (global.__DIAG_MISSING_MID === undefined) global.__DIAG_MISSING_MID = 0;
+          if (global.__DIAG_MISSING_MID < 20) {
+            console.log('[MID-DIAG] Email finalized with NO Message-ID found. subject=%s from=%s bodyLen=%d',
+              JSON.stringify(current.subject), JSON.stringify(current.from), current.body.length);
+            global.__DIAG_MISSING_MID++;
+          }
+        }
         pushCurrent();
         current = { subject: '', from: '', to: '', date: '', messageId: '', body: '', isInternal: false, isSentByUser: false };
         inBody = false;
+        lastHeaderField = null;
         return;
       }
       if (!current) return;
       if (!inBody) {
-        if (line === '' || line === '\r') { inBody = true; return; }
+        if (line === '' || line === '\r') { inBody = true; lastHeaderField = null; return; }
+
+        // RFC 5322 header folding: a continuation line starts with a space or tab and
+        // belongs to whichever header field came immediately before it. Append it
+        // (space-joined) to that field rather than treating it as a new header.
+        if ((line.startsWith(' ') || line.startsWith('\t')) && lastHeaderField) {
+          const continuation = line.trim();
+          if (continuation) {
+            current[lastHeaderField] = (current[lastHeaderField] ? current[lastHeaderField] + ' ' : '') + continuation;
+            if (lastHeaderField === 'messageId' && global.__DIAG_FOUND_MID !== undefined && global.__DIAG_FOUND_MID < 20) {
+              console.log('[MID-DIAG] Folded continuation appended to messageId:', JSON.stringify(line), '-> now:', JSON.stringify(current.messageId));
+            }
+          }
+          return;
+        }
+
         const lower = line.toLowerCase();
-        if (lower.startsWith('subject:')) current.subject = line.substring(8).trim();
-        else if (lower.startsWith('from:')) current.from = line.substring(5).trim();
-        else if (lower.startsWith('to:')) current.to = line.substring(3).trim();
-        else if (lower.startsWith('date:')) current.date = line.substring(5).trim();
-        else if (lower.startsWith('message-id:')) current.messageId = line.substring(11).trim();
+        if (lower.startsWith('subject:')) { current.subject = line.substring(8).trim(); lastHeaderField = 'subject'; }
+        else if (lower.startsWith('from:')) { current.from = line.substring(5).trim(); lastHeaderField = 'from'; }
+        else if (lower.startsWith('to:')) { current.to = line.substring(3).trim(); lastHeaderField = 'to'; }
+        else if (lower.startsWith('date:')) { current.date = line.substring(5).trim(); lastHeaderField = 'date'; }
+        else if (lower.startsWith('message-id:')) {
+          current.messageId = line.substring(11).trim();
+          lastHeaderField = 'messageId';
+          if (global.__DIAG_FOUND_MID === undefined) global.__DIAG_FOUND_MID = 0;
+          if (global.__DIAG_FOUND_MID < 20) {
+            console.log('[MID-DIAG] FOUND Message-ID line:', JSON.stringify(line), '-> parsed as:', JSON.stringify(current.messageId));
+            global.__DIAG_FOUND_MID++;
+          }
+        }
+        else {
+          // Any other header line (not one we track) — clear lastHeaderField so a
+          // following indented line isn't wrongly appended to an unrelated field.
+          lastHeaderField = null;
+        }
       } else {
-        // No truncation here — MIME headers/boundaries/encoding markers for this part
-        // can appear anywhere in the body section, and truncating mid-stream (especially
-        // mid-base64) produces garbage after decoding. Full body is captured; finalizeEmail's
-        // cleanMimeBody decodes it properly, THEN truncates the final plain-text result.
-        // A hard ceiling still applies to avoid unbounded memory on pathological emails.
         if (current.body.length < MAX_RAW_BODY_LEN) current.body += line + '\n';
       }
     });
@@ -1507,6 +1620,20 @@ async function runThunderbirdSync() {
 
         if (sizeMB > 50) {
           console.log('[TB-SYNC] Streaming large file: %s (%d MB)', folderName, sizeMB);
+        }
+
+        // TEMP DIAGNOSTIC: log the exact path string and its stat info right before
+        // parsing, to rule out any path/file mismatch vs our manual standalone tests.
+        if (folderName === 'AP AIR') {
+          console.log('[PATH-DIAG] mboxPath=%s', JSON.stringify(mboxPath));
+          console.log('[PATH-DIAG] path length=%d, char codes of last 10 chars=%s',
+            mboxPath.length, JSON.stringify(mboxPath.slice(-10).split('').map(c => c.charCodeAt(0))));
+          try {
+            const s = fs.statSync(mboxPath);
+            console.log('[PATH-DIAG] stat: size=%d, mtime=%s', s.size, s.mtime.toISOString());
+          } catch (e) {
+            console.log('[PATH-DIAG] statSync FAILED:', e.message);
+          }
         }
 
         const totalProcessed = await parseMboxEmailsStreaming(mboxPath, handleBatch, { batchSize: 200 });

@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import logging
+import sqlite3
 
 from config import DB_PATH, SCHEMAS_DIR
 
@@ -242,6 +243,15 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
     # in the mail client carries no meaning for this app anymore. If supplier_id is still
     # not provided (e.g. sender matched no known supplier), it stays NULL, which is correct.
 
+
+async def upsert_email(db, data: dict) -> dict:
+    """
+    (Keep your existing docstring / earlier lines of the function —
+    thread_id resolution, sender_type resolution, supplier_id resolution —
+    UNCHANGED above this point. Only the block below — from the existence
+    check through the end of the function — should be replaced.)
+    """
+
     # Check if exists
     cursor = await db.execute(
         "SELECT id FROM emails WHERE message_id = ?",
@@ -281,24 +291,68 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
         return {"email_id": existing["id"], "action": "updated"}
 
     # Insert
-    cursor = await db.execute("""
-        INSERT INTO emails (
-            profile_name, account_email, folder_path, message_id,
-            subject, sender_email, sender_name, sent_at,
-            body_text, body_language, has_attachments, thread_id,
-            step_assigned, rfq_id, supplier_id, sender_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data.get("profile_name"), data.get("account_email"), data.get("folder_path"),
-        data.get("message_id"), data.get("subject"),
-        data.get("sender_email"), data.get("sender_name"), data.get("sent_at"),
-        data.get("body_text"), data.get("body_language"),
-        1 if data.get("has_attachments") else 0,
-        data.get("thread_id"), data.get("step_assigned", 0),
-        data.get("rfq_id"), data.get("supplier_id"), data.get("sender_type"),
-    ))
-    await db.commit()
-    return {"email_id": cursor.lastrowid, "action": "inserted"}
+    try:
+        cursor = await db.execute("""
+            INSERT INTO emails (
+                profile_name, account_email, folder_path, message_id,
+                subject, sender_email, sender_name, sent_at,
+                body_text, body_language, has_attachments, thread_id,
+                step_assigned, rfq_id, supplier_id, sender_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.get("profile_name"), data.get("account_email"), data.get("folder_path"),
+            data.get("message_id"), data.get("subject"),
+            data.get("sender_email"), data.get("sender_name"), data.get("sent_at"),
+            data.get("body_text"), data.get("body_language"),
+            1 if data.get("has_attachments") else 0,
+            data.get("thread_id"), data.get("step_assigned", 0),
+            data.get("rfq_id"), data.get("supplier_id"), data.get("sender_type"),
+        ))
+        await db.commit()
+        return {"email_id": cursor.lastrowid, "action": "inserted"}
+
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed: emails.message_id" not in str(e):
+            raise  # a different integrity error — don't mask it, something else is wrong
+
+        # Lost the race: another concurrent call (same Promise.all batch, or an
+        # overlapping batch) inserted this message_id between our SELECT and our
+        # INSERT. The row legitimately exists now — we just didn't see it in time.
+        # Fall through to the same UPDATE logic as the normal "already exists" path
+        # rather than surfacing this as a DB_ERROR.
+        await db.execute("""
+            UPDATE emails SET
+                profile_name = ?, account_email = ?, folder_path = ?,
+                subject = ?, sender_email = ?, sender_name = ?,
+                sent_at = ?, body_language = ?,
+                has_attachments = ?,
+                thread_id = CASE WHEN thread_id IS NULL THEN ? ELSE thread_id END,
+                body_text = ?,
+                supplier_id = CASE WHEN supplier_id IS NULL THEN ? ELSE supplier_id END,
+                sender_type = CASE WHEN sender_type IS NULL THEN ? ELSE sender_type END,
+                step_assigned = CASE WHEN nlp_status IN ('completed','manual') THEN step_assigned ELSE ? END,
+                parsed_at = datetime('now')
+            WHERE message_id = ?
+        """, (
+            data.get("profile_name"), data.get("account_email"), data.get("folder_path"),
+            data.get("subject"), data.get("sender_email"), data.get("sender_name"),
+            data.get("sent_at"), data.get("body_language"),
+            1 if data.get("has_attachments") else 0,
+            data.get("thread_id"),
+            data.get("body_text"),
+            data.get("supplier_id"),
+            data.get("sender_type"),
+            data.get("step_assigned", 0),
+            data.get("message_id"),
+        ))
+        await db.commit()
+
+        row_cursor = await db.execute(
+            "SELECT id FROM emails WHERE message_id = ?",
+            (data.get("message_id"),)
+        )
+        row = await row_cursor.fetchone()
+        return {"email_id": row["id"] if row else None, "action": "updated_after_race"}
 
 
 async def query_emails(
