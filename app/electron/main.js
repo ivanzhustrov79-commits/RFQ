@@ -16,7 +16,14 @@ const fs = require('fs');
 const os = require('os');
 const http = require('http');
 
+
+// ── Add timestamp wrapper here ──
+const origLog = console.log;
+console.log = (...args) => origLog(`[${new Date().toISOString()}]`, ...args);
+// ────────────────────────────────
+
 let mainWindow;
+
 
 const GREY_NAMES = new Set(['sent','drafts','trash','outbox','junk','spam','archive','templates','queue','корзина','черновики','отправленные']);
 const SKIP_FOLDERS = new Set(['news','2026']);
@@ -105,6 +112,14 @@ async function queueEmailsForBackgroundNLP(emails) {
 
 // ── Persist emails to SQLite via Python backend ──
 // meta: { folderName, accountEmail, supplierId } — explicit, not parsed from a key string.
+function parseReferencesHeader(raw) {
+  // The Pydantic model (models.py ParsedEmail.references) expects List[str] —
+  // individual Message-IDs, not the raw header blob. Extract each <...> token.
+  if (!raw) return [];
+  const matches = raw.match(/<[^>]+>/g);
+  return matches || [];
+}
+
 async function persistEmailsToDB(emails, meta = {}) {
   if (!pythonAvailable || !emails || emails.length === 0) return;
 
@@ -163,6 +178,8 @@ async function persistEmailsToDB(emails, meta = {}) {
           step_assigned: email.stepAssigned || 0,
           rfq_id: null,
           supplier_id: resolvedSupplierId,
+          in_reply_to: email.inReplyTo || null,
+          references: parseReferencesHeader(email.references),
         });
         stored++;
       } catch (e) {
@@ -892,7 +909,7 @@ async function parseMboxEmailsStreaming(mboxPath, onBatch, options = {}) {
           }
         }
         pushCurrent();
-        current = { subject: '', from: '', to: '', date: '', messageId: '', body: '', isInternal: false, isSentByUser: false };
+        current = { subject: '', from: '', to: '', date: '', messageId: '', inReplyTo: '', references: '', body: '', isInternal: false, isSentByUser: false };
         inBody = false;
         lastHeaderField = null;
         return;
@@ -929,6 +946,8 @@ async function parseMboxEmailsStreaming(mboxPath, onBatch, options = {}) {
             global.__DIAG_FOUND_MID++;
           }
         }
+        else if (lower.startsWith('in-reply-to:')) { current.inReplyTo = line.substring(12).trim(); lastHeaderField = 'inReplyTo'; }
+        else if (lower.startsWith('references:')) { current.references = line.substring(11).trim(); lastHeaderField = 'references'; }
         else {
           // Any other header line (not one we track) — clear lastHeaderField so a
           // following indented line isn't wrongly appended to an unrelated field.

@@ -137,11 +137,23 @@ Rules:
 
 
 def classify_step_llm(subject: str, body_text: str,
+                      sender_role: str = "unknown",
                       has_attachments: bool = False,
                       previous_emails: Optional[List[Dict]] = None,
                       learned_rules_hint: str = "") -> Optional[Dict[str, Any]]:
     """
-    Use LLM to classify email to workflow step. Returns None if Ollama unavailable.
+    Use LLM to classify email to workflow step (new 4-step taxonomy: PR/RFQ/
+    CI/Downpayment), plus signal_type (advances/holds/neutral) for the
+    Kanban card color logic.
+
+    sender_role: "boss" | "user" | "supplier" | "unknown" — who actually
+    sent THIS email. Required for signal_type to be judged correctly, since
+    the step definitions are explicitly directional (e.g. RFQ's "advances"
+    is the supplier confirming, not you sending) — this is a data fact the
+    LLM has no way to infer from content alone, so it's passed in rather
+    than guessed. Computed by the caller via database.determine_sender_role.
+
+    Returns None if Ollama unavailable.
     learned_rules_hint: optional text block of active learned rules (from BOOST corrections)
     to inject into the prompt, making local classification smarter over time.
     """
@@ -156,32 +168,34 @@ def classify_step_llm(subject: str, body_text: str,
             prev_context += f"\nPrevious email {i+1}: step {prev.get('step', '?')} - {prev.get('subject', 'N/A')}"
 
     prompt = f"""You are an RFQ workflow classifier for agricultural machinery parts procurement.
-Classify this email into one of 6 steps. The emails are from Russian/Chinese/Turkish suppliers.
+Classify this email into one of 4 steps. The emails are from Russian/Chinese/Turkish suppliers.
 
 Workflow Steps:
-0: Purchase Request - initial inquiry (internal trigger from boss, OR our first ask to
-   supplier). NOTE: not every early email is RFQ-related — some are just informational/
-   context-setting with no real connection to a price request.
-1: RFQ Sent - we sent supplier a detailed request for prices on a specific part list
-2: RFQ Received - supplier's price/availability answer for parts not previously quoted.
-   This includes the FIRST complete answer AND any follow-up batches covering parts the
-   supplier hadn't priced yet ("still checking, will send rest") — these are still step 2,
-   NOT negotiation, because they're new pricing info, not discussion of existing prices.
-3: Negotiation - discussion SPECIFICALLY about prices/availability/quantity/substitute
-   parts that were ALREADY quoted in step 2. If this email introduces brand new parts or
-   prices never mentioned before, it's step 2, not step 3 — step 3 requires an existing
-   quote being discussed, not a fresh one.
-4: Invoice - supplier sends invoice or proforma invoice (PI), including revisions
-5: CI Approved - WE confirm acceptance of prices for a specific part list. This list
-   almost always differs from the original request (parts added/removed/changed) —
-   if multiple confirmation emails exist, the LATEST one reflects the true final list.
+0: PR (Purchase Request) — INTERNAL ONLY, never supplier-facing. Your boss
+   asking you to source something, or you confirming you'll handle it. If
+   this email involves a supplier at all (sender_role=supplier, or clearly
+   addressed to one), it is NOT step 0 — use step 1 (RFQ) instead.
+1: RFQ — covers both sending a supplier a request for quotation AND
+   receiving their price/availability answer. One merged step for the
+   whole "ask and get quoted" phase (old separate "RFQ Sent"/"RFQ Received"
+   steps no longer exist — both are step 1 now).
+2: CI — covers price negotiation, invoice/PI exchange, and final
+   confirmation/approval of the deal. One merged step for the whole "agree
+   on the deal" phase (old "Negotiation"/"Invoice"/"CI Approved" steps no
+   longer exist — all three are step 2 now).
+3: Downpayment — anything specifically about prepayment/advance payment/
+   deposit for this order: confirming it was sent, asking about it, or
+   confirming receipt.
+
+Sender role for THIS email: {sender_role}
+  ("user" = you sent this; "supplier" = the supplier sent this;
+   "boss" = your boss sent this; "unknown" = direction unclear)
 
 Russian keywords guide:
-- Step 0: запрос, расценка, запросить, КП (коммерческое предложение)
-- Step 2: прайс, цена, предложение, проформа, PF, PI, котировка
-- Step 3: переговоры, уточнение, вопрос, согласование
-- Step 4: инвойс, CI, счет, отгрузка, B/L, коносамент
-- Step 5: оплата, SWIFT, платеж, получен, доставлен, забор груза
+- Step 0: запрос, расценка, запросить, КП (коммерческое предложение) — only when NOT supplier-facing
+- Step 1: прайс, цена, предложение, проформа, PF, котировка
+- Step 2: переговоры, согласование, инвойс, CI, счет, отгрузка, B/L, коносамент
+- Step 3: предоплата, аванс, авансовый платеж
 {learned_rules_hint}
 
 Email Subject: {subject}
@@ -191,6 +205,30 @@ Has Attachments: {has_attachments}
 Body:
 {body_truncated}
 
+In addition to the step, determine this email's SIGNAL relative to that
+step — whether it represents the step's defining success condition, an
+explicit hold/cancellation, or neither. This drives a colored status card,
+so be conservative: only mark "advances" when the condition is clearly met.
+
+  - Step 1 (RFQ) "advances": the SUPPLIER (sender_role=supplier) is
+    confirming they received/are answering the RFQ. Your own outgoing
+    request is "neutral" for this purpose, not "advances" — only the
+    supplier's confirmation counts.
+  - Step 2 (CI) "advances": YOU (sender_role=user) are sending the supplier
+    approval/acceptance of their invoice, PI, or CI. The supplier SENDING
+    the invoice is "neutral" here — only YOUR approval of it counts.
+  - Step 3 (Downpayment) "advances": ANY of — you confirming to the supplier
+    that prepayment was made; your boss messaging you about prepayment for
+    this order; OR the supplier confirming they received the prepayment.
+  - Step 0 (PR): signal_type is always "neutral" — PR has no success/hold
+    tracking at all.
+  - "holds" (steps 1-3 only): this email explicitly pauses, postpones, or
+    cancels progress on this step — e.g. "let's hold off", "cancel this
+    order", "we need to pause this".
+  - "neutral": anything not meeting the above — most routine correspondence,
+    including ordinary back-and-forth that doesn't itself represent the
+    step's defining success condition.
+
 Also determine: is this email SIGNIFICANT for this step, or is it NOISE? Significant means
 it substantively advances the business (contains actual prices, part lists, decisions,
 confirmations). Noise means small talk, greetings, "will check and reply later" with no
@@ -199,7 +237,7 @@ for tracking the deal.
 
 Return ONLY a JSON object:
 {{
-  "suggested_step": 0-5,
+  "suggested_step": 0-3,
   "step_name": "human readable name",
   "confidence": 0.0 to 1.0,
   "reason": "brief explanation in English",
@@ -207,7 +245,8 @@ Return ONLY a JSON object:
   "has_conflict": false,
   "needs_review": true/false,
   "is_significant": true/false,
-  "significance_confidence": 0.0 to 1.0
+  "significance_confidence": 0.0 to 1.0,
+  "signal_type": "advances" | "holds" | "neutral"
 }}
 
 Set needs_review=true if: the email content is genuinely ambiguous between two steps,
@@ -218,11 +257,19 @@ mixes multiple topics, or you are not confident which step applies."""
         return None
 
     step = result.get("suggested_step", 0)
-    if not isinstance(step, int) or step < 0 or step > 5:
+    if not isinstance(step, int) or step < 0 or step > 3:
         step = 0
 
     confidence = result.get("confidence", 0.5)
     needs_review = result.get("needs_review", False) or confidence < 0.6
+
+    signal_type = result.get("signal_type", "neutral")
+    if signal_type not in ("advances", "holds", "neutral"):
+        signal_type = "neutral"
+    if step == 0:
+        # PR never participates in the color system, regardless of what the
+        # LLM returned — enforced here rather than trusted to the prompt.
+        signal_type = "neutral"
 
     return {
         "suggested_step": step,
@@ -235,6 +282,7 @@ mixes multiple topics, or you are not confident which step applies."""
         "needs_review": needs_review,
         "is_significant": result.get("is_significant", True),
         "significance_confidence": result.get("significance_confidence", 0.5),
+        "signal_type": signal_type,
     }
 
 
@@ -370,15 +418,17 @@ def extract_rfq(subject: str, body_text: str, sender_domain: str,
 
 
 def classify_step(subject: str, body_text: str,
+                  sender_role: str = "unknown",
                   has_attachments: bool = False,
                   previous_emails: Optional[List[Dict]] = None,
                   learned_rules_hint: str = "") -> Dict[str, Any]:
     """
     Classify workflow step: tries LLM first, falls back to heuristics.
     learned_rules_hint: text block of active learned rules from BOOST teaching loop.
+    sender_role: see classify_step_llm — "boss"|"user"|"supplier"|"unknown".
     """
     # Try LLM first (Phase 5)
-    llm_result = classify_step_llm(subject, body_text, has_attachments, previous_emails, learned_rules_hint)
+    llm_result = classify_step_llm(subject, body_text, sender_role, has_attachments, previous_emails, learned_rules_hint)
     if llm_result:
         logger.info("[AI] LLM classify succeeded: step=%d %s (conf=%.2f)",
                    llm_result["suggested_step"],
@@ -386,6 +436,12 @@ def classify_step(subject: str, body_text: str,
                    llm_result["confidence"])
         return llm_result
 
-    # Fallback to heuristics (Phase 4)
+    # Fallback to heuristics (Phase 4) — the heuristic classifier doesn't
+    # know about the new signal_type concept (it's a much simpler keyword/
+    # regex fallback, not worth teaching this to for a degraded-mode path).
+    # Default to "neutral" so downstream code always sees a consistent
+    # shape regardless of which path produced the classification.
     logger.debug("[AI] LLM unavailable, using heuristic classification")
-    return heuristic_classify(subject, body_text, has_attachments, previous_emails)
+    result = heuristic_classify(subject, body_text, has_attachments, previous_emails)
+    result.setdefault("signal_type", "neutral")
+    return result

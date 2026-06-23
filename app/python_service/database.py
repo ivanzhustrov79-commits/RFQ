@@ -143,6 +143,7 @@ async def _create_tables_manual():
 async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
     """Insert or update email by message_id."""
     import re
+    import json
 
     db = await get_db()
 
@@ -150,6 +151,72 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
     # Avoids repeated DB lookups during bulk import
     if not hasattr(upsert_email, '_thread_cache'):
         upsert_email._thread_cache = {}
+
+    # ------------------------------------------------------------------
+    # Reply-chain thread resolution (runs BEFORE subject-prefix fallback)
+    # ------------------------------------------------------------------
+    # In-Reply-To / References give a near-zero-ambiguity signal: if this
+    # email is a reply to a specific prior Message-ID we already have in
+    # the DB, inherit that email's thread_id directly — far more reliable
+    # than guessing from subject text. Subject-prefix matching only runs
+    # as a fallback when no reply-chain match is found (new conversation,
+    # or the parent email hasn't synced/was skipped).
+    if not data.get("thread_id"):
+        candidate_message_ids = []
+
+        in_reply_to = (data.get("in_reply_to") or "").strip()
+        if in_reply_to:
+            candidate_message_ids.append(in_reply_to)
+
+        references_list = data.get("references") or []
+        if references_list:
+            # References lists the whole ancestor chain, oldest-first per
+            # RFC 5322 — the immediate parent is the LAST entry. Check
+            # nearest-ancestor-first so we prefer the closest match.
+            for ref_id in reversed(references_list):
+                if ref_id not in candidate_message_ids:
+                    candidate_message_ids.append(ref_id)
+
+        # Capped one-time diagnostic (first 20 only, then silent) — same
+        # pattern as the existing MID-DIAG/PUSH-DIAG logs — confirms whether
+        # reply-chain matching is actually firing in practice.
+        if not hasattr(upsert_email, '_thread_resolve_diag_count'):
+            upsert_email._thread_resolve_diag_count = 0
+
+        matched_via_reply_chain = False
+        for candidate_id in candidate_message_ids:
+            parent_row = await db.execute(
+                "SELECT thread_id FROM emails WHERE message_id = ?",
+                (candidate_id,)
+            )
+            parent = await parent_row.fetchone()
+            if parent and parent["thread_id"] is not None:
+                data["thread_id"] = parent["thread_id"]
+                matched_via_reply_chain = True
+                break
+            # No match (or parent exists but isn't itself thread-resolved
+            # yet) — try the next candidate, then fall through to the
+            # subject-prefix block below if none match at all.
+
+        if upsert_email._thread_resolve_diag_count < 20:
+            if matched_via_reply_chain:
+                logger.info(
+                    "[THREAD-RESOLVE-DIAG] %s matched via reply-chain -> thread_id=%s",
+                    data.get("message_id"), data.get("thread_id"),
+                )
+            elif candidate_message_ids:
+                logger.info(
+                    "[THREAD-RESOLVE-DIAG] %s had reply-chain headers but no match found "
+                    "(parent not yet synced) -> falling to subject-prefix",
+                    data.get("message_id"),
+                )
+            else:
+                logger.info(
+                    "[THREAD-RESOLVE-DIAG] %s had no in_reply_to/references at all "
+                    "-> falling to subject-prefix",
+                    data.get("message_id"),
+                )
+            upsert_email._thread_resolve_diag_count += 1
 
     # Auto-resolve thread_id from subject + supplier_id if not provided
     if not data.get("thread_id") and data.get("supplier_id") and data.get("subject"):
@@ -244,14 +311,6 @@ async def upsert_email(data: Dict[str, Any]) -> Dict[str, Any]:
     # not provided (e.g. sender matched no known supplier), it stays NULL, which is correct.
 
 
-async def upsert_email(db, data: dict) -> dict:
-    """
-    (Keep your existing docstring / earlier lines of the function —
-    thread_id resolution, sender_type resolution, supplier_id resolution —
-    UNCHANGED above this point. Only the block below — from the existence
-    check through the end of the function — should be replaced.)
-    """
-
     # Check if exists
     cursor = await db.execute(
         "SELECT id FROM emails WHERE message_id = ?",
@@ -273,6 +332,7 @@ async def upsert_email(db, data: dict) -> dict:
                 supplier_id = CASE WHEN supplier_id IS NULL THEN ? ELSE supplier_id END,
                 sender_type = CASE WHEN sender_type IS NULL THEN ? ELSE sender_type END,
                 step_assigned = CASE WHEN nlp_status IN ('completed','manual') THEN step_assigned ELSE ? END,
+                in_reply_to = ?, references_header = ?,
                 parsed_at = datetime('now')
             WHERE message_id = ?
         """, (
@@ -285,6 +345,7 @@ async def upsert_email(db, data: dict) -> dict:
             data.get("supplier_id"),
             data.get("sender_type"),
             data.get("step_assigned", 0),
+            data.get("in_reply_to"), json.dumps(data.get("references") or []),
             data.get("message_id"),
         ))
         await db.commit()
@@ -297,8 +358,9 @@ async def upsert_email(db, data: dict) -> dict:
                 profile_name, account_email, folder_path, message_id,
                 subject, sender_email, sender_name, sent_at,
                 body_text, body_language, has_attachments, thread_id,
-                step_assigned, rfq_id, supplier_id, sender_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                step_assigned, rfq_id, supplier_id, sender_type,
+                in_reply_to, references_header
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             data.get("profile_name"), data.get("account_email"), data.get("folder_path"),
             data.get("message_id"), data.get("subject"),
@@ -307,6 +369,7 @@ async def upsert_email(db, data: dict) -> dict:
             1 if data.get("has_attachments") else 0,
             data.get("thread_id"), data.get("step_assigned", 0),
             data.get("rfq_id"), data.get("supplier_id"), data.get("sender_type"),
+            data.get("in_reply_to"), json.dumps(data.get("references") or []),
         ))
         await db.commit()
         return {"email_id": cursor.lastrowid, "action": "inserted"}
@@ -331,6 +394,7 @@ async def upsert_email(db, data: dict) -> dict:
                 supplier_id = CASE WHEN supplier_id IS NULL THEN ? ELSE supplier_id END,
                 sender_type = CASE WHEN sender_type IS NULL THEN ? ELSE sender_type END,
                 step_assigned = CASE WHEN nlp_status IN ('completed','manual') THEN step_assigned ELSE ? END,
+                in_reply_to = ?, references_header = ?,
                 parsed_at = datetime('now')
             WHERE message_id = ?
         """, (
@@ -343,6 +407,7 @@ async def upsert_email(db, data: dict) -> dict:
             data.get("supplier_id"),
             data.get("sender_type"),
             data.get("step_assigned", 0),
+            data.get("in_reply_to"), json.dumps(data.get("references") or []),
             data.get("message_id"),
         ))
         await db.commit()
@@ -353,6 +418,99 @@ async def upsert_email(db, data: dict) -> dict:
         )
         row = await row_cursor.fetchone()
         return {"email_id": row["id"] if row else None, "action": "updated_after_race"}
+
+
+STEP_NAMES = {0: "PR", 1: "RFQ", 2: "CI", 3: "Downpayment"}
+
+
+async def compute_step_color(thread_id, step: int) -> Dict[str, Any]:
+    """
+    Implements the step-color redesign spec, sections 3.2 (color rule) and
+    3.3 (list ordering), for ONE step within ONE thread.
+
+    thread_id is used as the practical "one RFQ/deal" unit — rfq_id is not
+    yet populated/wired up anywhere in this codebase (confirmed: no code
+    writes to it), so thread_id is what already groups one conversation's
+    emails together in practice.
+
+    Color rule (spec 3.2):
+      - zero emails in this step -> white
+      - emails exist, but none are advances/holds (all neutral, including
+        NULL/unclassified, which is treated identically to neutral) -> yellow
+      - otherwise, the MOST RECENT advances/holds email decides: advances ->
+        green, holds -> yellow. This is what makes green "sticky": ordinary
+        neutral correspondence (including a high volume of routine supplier
+        chatter) can never move a green step back to yellow — only a new
+        holds email can, and a new advances email after a hold was lifted
+        correctly flips it back to green.
+      - Step 0 (PR) never participates in this system at all -> always white,
+        regardless of email count or content (enforced in pipeline.py's
+        classifier too, but enforced here as well since this is the
+        authoritative read path).
+
+    List ordering rule (spec 3.3):
+      - signal stack first (all advances/holds emails, most recent first —
+        if the step's status flipped back and forth multiple times, ALL of
+        those signal emails stay stacked at the top, not just the latest one)
+      - then all neutral emails, in normal chronological order
+      - the single most recent signal email is always the very top entry
+    """
+    db = await get_db()
+
+    cursor = await db.execute("""
+        SELECT id, subject, sender_email, sent_at, signal_type
+        FROM emails WHERE thread_id = ? AND step_assigned = ?
+        ORDER BY sent_at ASC
+    """, (str(thread_id), step))
+    emails = [dict(r) for r in await cursor.fetchall()]
+
+    if step == 0 or not emails:
+        return {
+            "step": step,
+            "step_name": STEP_NAMES.get(step, f"Step {step}"),
+            "color": "white",
+            "top_email_id": None,
+            "emails": emails,
+        }
+
+    signal_emails = [e for e in emails if e["signal_type"] in ("advances", "holds")]
+    neutral_emails = [e for e in emails if e["signal_type"] not in ("advances", "holds")]
+
+    # Signal stack: most recent first (NOT just the single latest — every
+    # signal email stays visible, per spec 3.3's "key stack" requirement).
+    signal_emails.sort(key=lambda e: e["sent_at"], reverse=True)
+    # Remainder: normal chronological order (oldest first, matching the
+    # existing default email-list sort used elsewhere in this app).
+    neutral_emails.sort(key=lambda e: e["sent_at"])
+
+    ordered_emails = signal_emails + neutral_emails
+
+    if not signal_emails:
+        return {
+            "step": step,
+            "step_name": STEP_NAMES.get(step, f"Step {step}"),
+            "color": "yellow",
+            "top_email_id": None,
+            "emails": ordered_emails,
+        }
+
+    most_recent_signal = signal_emails[0]
+    color = "green" if most_recent_signal["signal_type"] == "advances" else "yellow"
+
+    return {
+        "step": step,
+        "step_name": STEP_NAMES.get(step, f"Step {step}"),
+        "color": color,
+        "top_email_id": most_recent_signal["id"],
+        "emails": ordered_emails,
+    }
+
+
+async def get_thread_step_statuses(thread_id) -> List[Dict[str, Any]]:
+    """Returns compute_step_color's result for all 4 steps (PR/RFQ/CI/
+    Downpayment) for one thread — one call covers everything a Kanban
+    RFQ-card needs to render, rather than 4 separate round-trips."""
+    return [await compute_step_color(thread_id, step) for step in range(4)]
 
 
 async def query_emails(
@@ -490,7 +648,8 @@ async def get_next_nlp_pending() -> Optional[Dict[str, Any]]:
     """)
     await db.commit()
     cursor = await db.execute("""
-        SELECT id, message_id, subject, body_text, sender_email, body_language, supplier_id, thread_id
+        SELECT id, message_id, subject, body_text, sender_email, account_email,
+               body_language, supplier_id, thread_id
         FROM emails
         WHERE nlp_status = 'pending'
         ORDER BY sent_at ASC
@@ -515,24 +674,183 @@ async def save_nlp_result(email_id: int, result: Dict[str, Any]) -> None:
     import json
     db = await get_db()
     step = result.get("step")
-    if step is not None and isinstance(step, int) and 0 <= step <= 5:
+    signal_type = result.get("signal_type", "neutral")
+    if signal_type not in ("advances", "holds", "neutral"):
+        signal_type = "neutral"
+
+    if step is not None and isinstance(step, int) and 0 <= step <= 3:
         await db.execute("""
             UPDATE emails SET
                 nlp_status = 'completed',
                 nlp_result = ?,
                 nlp_enriched_at = datetime('now'),
-                step_assigned = ?
+                step_assigned = ?,
+                signal_type = ?
             WHERE id = ?
-        """, (json.dumps(result), step, email_id))
+        """, (json.dumps(result), step, signal_type, email_id))
     else:
         await db.execute("""
             UPDATE emails SET
                 nlp_status = 'completed',
                 nlp_result = ?,
-                nlp_enriched_at = datetime('now')
+                nlp_enriched_at = datetime('now'),
+                signal_type = ?
             WHERE id = ?
-        """, (json.dumps(result), email_id))
+        """, (json.dumps(result), signal_type, email_id))
     await db.commit()
+
+    # Part-number reconciliation runs AFTER the main save, since part numbers
+    # are only known now (post-NLP) — never at sync time. Wrapped defensively:
+    # a bug in this newer, more experimental piece must never take down NLP
+    # processing itself, which is the part of the pipeline everything else
+    # depends on.
+    try:
+        part_numbers = result.get("part_numbers") or []
+        if part_numbers:
+            row_cursor = await db.execute(
+                "SELECT supplier_id, thread_id, message_id, sent_at FROM emails WHERE id = ?",
+                (email_id,)
+            )
+            row = await row_cursor.fetchone()
+            if row:
+                await reconcile_thread_by_part_numbers(
+                    db, email_id, row["message_id"], row["supplier_id"],
+                    row["thread_id"], row["sent_at"], part_numbers,
+                )
+    except Exception as e:
+        logger.warning("[PART-MERGE] reconciliation failed for email_id=%s: %s", email_id, e)
+
+
+# Pragmatic stand-in for the real signal (whether the prior RFQ is already
+# approved/closed) until rfq_id/rfqs.status is actually wired up to threads —
+# that work is deferred. A shared part number alone is NOT reliable evidence
+# of "same RFQ": the same part is routinely reordered from the same supplier
+# across separate, sequential deals months apart. Restricting matches to
+# within this many days of the candidate thread's most recent matching part
+# avoids merging genuinely separate reorders together. Revisit once RFQ
+# approval/closed status is available as a real signal instead of a time
+# heuristic.
+MERGE_TIME_WINDOW_DAYS = 45
+
+
+async def reconcile_thread_by_part_numbers(
+    db, email_id: int, message_id: Optional[str], supplier_id: Optional[int],
+    thread_id, sent_at: Optional[str], part_numbers: List[Dict[str, Any]],
+) -> None:
+    """
+    Called after an email's NLP extraction completes (see save_nlp_result).
+    For each extracted part number, checks whether the same supplier already
+    has that part number attached to a DIFFERENT thread, within
+    MERGE_TIME_WINDOW_DAYS of this email — if so, merges this email's current
+    thread into that other thread, using the exact same mechanism main.py's
+    analyze_thread_merges already uses for LLM-judged merges (UPDATE emails
+    SET thread_id..., UPDATE threads SET merged_into_thread_id...).
+
+    Always records the extracted parts into the `parts` table regardless of
+    whether a merge fires — this is what feeds the matching index for future
+    emails to compare against.
+    """
+    if not supplier_id or not thread_id or not part_numbers:
+        return
+
+    import json as _json
+    thread_id_str = str(thread_id)
+    merge_target = None
+    merge_part_number = None
+
+    for p in part_numbers:
+        # Same historical-shape inconsistency as backfill_parts.py: older
+        # extractions (BASE heuristic mode, earlier pipeline versions) stored
+        # part_numbers as bare strings, not {"part_number": ...} dicts.
+        if isinstance(p, dict):
+            part_number = str(p.get("part_number") or "").strip()
+            description = p.get("description")
+            quantity = p.get("quantity")
+            unit_price = p.get("unit_price")
+            currency = p.get("currency")
+        elif isinstance(p, str):
+            part_number = p.strip()
+            description = None
+            quantity = None
+            unit_price = None
+            currency = None
+        else:
+            continue
+
+        if not part_number:
+            continue
+
+        if merge_target is None:
+            # Look for this part number under a DIFFERENT thread, same
+            # supplier, within the time window — nearest match wins.
+            cursor = await db.execute("""
+                SELECT thread_id FROM parts
+                WHERE supplier_id = ? AND part_number = ? AND thread_id IS NOT NULL
+                  AND thread_id != ?
+                  AND email_sent_at IS NOT NULL AND ? IS NOT NULL
+                  AND ABS(julianday(?) - julianday(email_sent_at)) <= ?
+                ORDER BY email_sent_at DESC
+                LIMIT 1
+            """, (supplier_id, part_number, thread_id_str, sent_at, sent_at, MERGE_TIME_WINDOW_DAYS))
+            match = await cursor.fetchone()
+            if match:
+                merge_target = match["thread_id"]
+                merge_part_number = part_number
+
+        # Always record this part, whether or not it triggered a merge —
+        # feeds the matching index for future emails to compare against.
+        await db.execute("""
+            INSERT INTO parts (supplier_id, thread_id, message_id, part_number,
+                                description, quantity, price, currency, email_sent_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            supplier_id, thread_id_str, message_id, part_number,
+            description, quantity, unit_price,
+            currency, sent_at,
+        ))
+
+    await db.commit()
+
+    if merge_target and str(merge_target) != thread_id_str:
+        await db.execute("UPDATE emails SET thread_id = ? WHERE thread_id = ?", (merge_target, thread_id_str))
+        await db.execute("""
+            UPDATE threads SET merged_into_thread_id = ?, merge_confidence = 1.0,
+                                merge_status = 'auto_merged', merge_reason = ?
+            WHERE id = ?
+        """, (merge_target, f"shared part_number {merge_part_number} within {MERGE_TIME_WINDOW_DAYS} days", thread_id_str))
+        # Keep the parts index itself consistent — rows just inserted (or
+        # already existing) under the now-merged thread should point at the
+        # target thread, so future lookups see one unified history.
+        await db.execute("UPDATE parts SET thread_id = ? WHERE thread_id = ?", (merge_target, thread_id_str))
+        await db.commit()
+
+        # Audit trail, per the agreed approach: thread-merge decisions reuse
+        # learned_rules/rule_corrections with a deterministic pair-key
+        # condition_pattern — keyword-overlap matching (used for step/
+        # significance rules) doesn't apply to a decision about two specific
+        # threads, so this is looked up/recorded by pair key, not keywords.
+        try:
+            a, b = sorted([int(thread_id_str), int(merge_target)])
+            pair_key = f"thread_pair:{a}:{b}"
+        except (ValueError, TypeError):
+            pair_key = f"thread_pair:{thread_id_str}:{merge_target}"
+
+        await db.execute("""
+            INSERT INTO learned_rules (
+                rule_type, supplier_id, condition_pattern, condition_keywords,
+                action, confidence, times_confirmed, source_examples
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+        """, (
+            "thread_merge", supplier_id, pair_key, _json.dumps([]),
+            f"merge_into={merge_target}", 1.0,
+            _json.dumps([message_id] if message_id else []),
+        ))
+        await db.commit()
+
+        logger.info(
+            "[PART-MERGE] thread %s merged into %s via shared part_number %s (supplier_id=%s, email_id=%s)",
+            thread_id_str, merge_target, merge_part_number, supplier_id, email_id,
+        )
 
 
 async def mark_nlp_failed(email_id: int) -> None:
@@ -765,6 +1083,136 @@ async def run_migration_004():
                 )
     await db.commit()
     logger.info("Migration 004 applied")
+
+
+async def run_migration_005():
+    """Migration 005: reply-chain headers (In-Reply-To / References) for
+    deterministic thread assignment — see migration_005_reply_chain.sql."""
+    db = await get_db()
+    cursor = await db.execute("PRAGMA table_info(emails)")
+    columns = [row["name"] for row in await cursor.fetchall()]
+
+    if "in_reply_to" not in columns:
+        logger.info("Applying migration 005: adding reply-chain header columns")
+        await db.execute("ALTER TABLE emails ADD COLUMN in_reply_to TEXT")
+        await db.execute("ALTER TABLE emails ADD COLUMN references_header TEXT")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_emails_in_reply_to ON emails(in_reply_to)")
+        await db.commit()
+        logger.info("Migration 005 applied successfully")
+    else:
+        logger.debug("Migration 005 already applied")
+
+
+async def get_boss_addresses() -> set:
+    """Returns the configured Boss email addresses (lowercased), from the
+    boss_addresses table (see migration 007). Used by determine_sender_role
+    to recognize Boss<->user correspondence for PR/Downpayment classification."""
+    db = await get_db()
+    cursor = await db.execute("SELECT email FROM boss_addresses")
+    rows = await cursor.fetchall()
+    return set(r["email"].lower() for r in rows)
+
+
+def determine_sender_role(
+    sender_email: str, account_email: Optional[str],
+    supplier_id: Optional[int], boss_emails: set,
+) -> str:
+    """
+    Determines who actually sent this specific email — needed because the
+    new step definitions (RFQ/CI/Downpayment) are explicitly directional
+    (e.g. RFQ's 'advances' = the SUPPLIER confirming, not you sending), and
+    the LLM has no way to know this from email content alone; it's a data
+    fact, not something to infer from prose.
+
+    Returns one of: "boss" | "user" | "supplier" | "unknown"
+
+    Logic, using only data already available on the email row:
+      - sender matches a configured Boss address -> "boss"
+      - sender matches the account this email was synced from (i.e. you sent
+        it from your own mailbox) -> "user"
+      - otherwise, if a supplier_id is already resolved on this email, the
+        sender is most likely that supplier (supplier_id is only ever set
+        via address-matching against a known supplier contact) -> "supplier"
+      - otherwise -> "unknown"
+    """
+    sender_lower = (sender_email or "").lower()
+
+    if any(boss in sender_lower for boss in boss_emails):
+        return "boss"
+
+    if account_email and account_email.lower() in sender_lower:
+        return "user"
+
+    if supplier_id:
+        return "supplier"
+
+    return "unknown"
+
+
+async def run_migration_007():
+    """Migration 007: signal_type column (advances/holds/neutral) for the
+    step-color redesign, plus a dedicated boss_addresses config table.
+
+    Deliberately does NOT touch existing step_assigned values — that is a
+    one-time, content-aware DATA transformation (old 6-step taxonomy -> new
+    PR/RFQ/CI/Downpayment), not a safe additive schema change, so it lives in
+    the standalone migrate_step_logic.py script instead, run manually once
+    with an explicit confirmation step — never automatically at startup.
+    """
+    db = await get_db()
+    cursor = await db.execute("PRAGMA table_info(emails)")
+    columns = [row["name"] for row in await cursor.fetchall()]
+
+    if "signal_type" not in columns:
+        logger.info("Applying migration 007: adding signal_type column")
+        await db.execute("ALTER TABLE emails ADD COLUMN signal_type TEXT")
+        # Values: 'advances' | 'holds' | 'neutral' | NULL (unclassified —
+        # treated identically to 'neutral' by the color-computation logic).
+        await db.commit()
+
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='boss_addresses'"
+    )
+    if not await cursor.fetchone():
+        logger.info("Applying migration 007: creating boss_addresses table")
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS boss_addresses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+        """)
+        # Seed with the two addresses already hardcoded in main.js's
+        # `bosses` array (finalizeEmail's isInternal check) — same definition
+        # of "boss" the app has used all along, now made configurable.
+        await db.executescript("""
+            INSERT OR IGNORE INTO boss_addresses (email) VALUES
+                ('info@field-pro.ae'),
+                ('vlebedinets@agro-pro2014.ru');
+        """)
+        await db.commit()
+        logger.info("Migration 007 applied successfully")
+    else:
+        logger.debug("Migration 007 already applied")
+
+
+async def run_migration_006():
+    """Migration 006: link the previously-unused parts table to threads/emails
+    — see migration_006_parts_linkage.sql."""
+    db = await get_db()
+    cursor = await db.execute("PRAGMA table_info(parts)")
+    columns = [row["name"] for row in await cursor.fetchall()]
+
+    if "thread_id" not in columns:
+        logger.info("Applying migration 006: linking parts table to threads/emails")
+        await db.execute("ALTER TABLE parts ADD COLUMN thread_id TEXT")
+        await db.execute("ALTER TABLE parts ADD COLUMN message_id TEXT")
+        await db.execute("ALTER TABLE parts ADD COLUMN email_sent_at TEXT")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_parts_supplier_partnum ON parts(supplier_id, part_number)")
+        await db.commit()
+        logger.info("Migration 006 applied successfully")
+    else:
+        logger.debug("Migration 006 already applied")
 
 
 async def get_supplier_id_by_sender(sender_email: str) -> Optional[int]:

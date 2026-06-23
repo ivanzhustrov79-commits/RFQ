@@ -117,12 +117,14 @@ class StepClassification(BaseModel):
     alternative_steps: List[StepAlternative] = Field(default_factory=list)
     is_low_confidence: bool = False
     has_conflict: bool = False
+    signal_type: str = "neutral"  # "advances" | "holds" | "neutral"
 
 
 class NlpClassifyRequest(BaseModel):
     email_id: int
     subject: str
     body_text: str
+    sender_role: str = "unknown"  # "boss" | "user" | "supplier" | "unknown" — see database.determine_sender_role
     previous_emails_in_thread: List[PreviousEmailRef] = Field(default_factory=list)
 
 

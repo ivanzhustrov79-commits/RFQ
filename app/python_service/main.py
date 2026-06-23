@@ -16,7 +16,8 @@ from database import (
     get_supplier_by_domain, upsert_supplier,
     queue_emails_for_nlp, get_next_nlp_pending, mark_nlp_processing,
     save_nlp_result, mark_nlp_failed, get_nlp_results, get_nlp_queue_stats,
-    reset_stuck_processing, run_migration_004,
+    reset_stuck_processing, run_migration_004, run_migration_005, run_migration_006,
+    run_migration_007,
     get_supplier_id_by_sender, add_supplier_contact_email, get_supplier_contact_emails,
     run_migration_002, run_migration_003,
     reset_stuck_processing,
@@ -51,6 +52,9 @@ async def lifespan(app: FastAPI):
     await run_migration_002()
     await run_migration_003()
     await run_migration_004()
+    await run_migration_005()
+    await run_migration_006()
+    await run_migration_007()
     await reset_stuck_processing()
     _start_time = time.time()
 
@@ -932,6 +936,21 @@ async def get_thread_detail(thread_id: int):
     }
 
 
+@app.get("/db/thread/{thread_id}/step-statuses")
+async def get_thread_step_statuses_route(thread_id: int):
+    """
+    Returns color (green/yellow/white) and ordered email list for all 4 steps
+    (PR/RFQ/CI/Downpayment) of a single thread — see database.compute_step_color
+    for the full color/ordering rules (step-logic redesign spec sections 3.2/3.3).
+
+    One call per RFQ-card: a Kanban board rendering one RFQ needs all 4
+    step-columns' status at once, not 4 separate round-trips.
+    """
+    from database import get_thread_step_statuses
+    statuses = await get_thread_step_statuses(thread_id)
+    return {"thread_id": thread_id, "steps": statuses}
+
+
 class UpdateSupplierFolderRequest(BaseModel):
     folder_name: str  # e.g. "NINGBO" for NINGBO COMBINE
 
@@ -1040,6 +1059,7 @@ async def nlp_classify_step(request: NlpClassifyRequest):
             classify_step,
             subject=request.subject,
             body_text=request.body_text,
+            sender_role=request.sender_role,
             has_attachments=False,
             previous_emails=[{"step": p.step, "subject": request.subject} for p in request.previous_emails_in_thread] if request.previous_emails_in_thread else None,
         )
@@ -1112,16 +1132,25 @@ async def _nlp_background_worker():
 
                 # Fetch active learned rules (from BOOST teaching loop) for this supplier
                 from ai.rule_engine import get_active_rules, format_rules_for_prompt
-                from database import get_db
+                from database import get_db, get_boss_addresses, determine_sender_role
                 _db = await get_db()
                 active_rules = await get_active_rules(_db, "step_classification", email.get("supplier_id"))
                 significance_rules = await get_active_rules(_db, "significance", email.get("supplier_id"))
                 rules_hint = format_rules_for_prompt(active_rules) + format_rules_for_prompt(significance_rules)
 
+                # Who actually sent this email — needed for the new directional
+                # step definitions (RFQ/CI/Downpayment "advances" conditions).
+                boss_emails = await get_boss_addresses()
+                sender_role = determine_sender_role(
+                    email["sender_email"], email.get("account_email"),
+                    email.get("supplier_id"), boss_emails,
+                )
+
                 classification = await asyncio.to_thread(
                     classify_step,
                     subject=email["subject"] or "",
                     body_text=email["body_text"] or "",
+                    sender_role=sender_role,
                     has_attachments=False,
                     previous_emails=None,
                     learned_rules_hint=rules_hint,
@@ -1211,6 +1240,7 @@ async def _nlp_background_worker():
                     "step_name": classification.get("step_name", ""),
                     "confidence": classification.get("confidence", 0),
                     "reason": classification.get("reason", ""),
+                    "signal_type": classification.get("signal_type", "neutral"),
                     "processing_time_ms": int(dt * 1000),
                     "needs_review": needs_review,
                     "suggested_thread_id": suggested_thread_id,
@@ -1377,6 +1407,118 @@ Rules:
 
     logger.warning("[RFQ-NAME] AI returned bad result for supplier %d, using fallback", request.supplier_id)
     return _fallback_name()
+
+from pydantic import BaseModel
+import sync_reliability
+
+
+class VerifySyncRequest(BaseModel):
+    account_email: str
+    folder_path: str
+    expected_count: int
+
+
+class VerifySyncResponse(BaseModel):
+    account_email: str
+    folder_path: str
+    expected_count: int
+    actual_count: int
+    is_match: bool
+    missing_count: int
+
+
+@app.post("/db/verify-sync", response_model=VerifySyncResponse)
+async def db_verify_sync(request: VerifySyncRequest):
+    """
+    Called by Electron once per folder right after parseMboxEmailsStreaming
+    finishes (totalProcessed is known). Compares that count against what's
+    actually persisted in the DB for the account/folder.
+    """
+    try:
+        result = await sync_reliability.verify_sync_completeness(
+            request.account_email, request.folder_path, request.expected_count
+        )
+        return VerifySyncResponse(**result)
+    except Exception as e:
+        logger.error("Sync verification error: %s", e)
+        raise HTTPException(status_code=500, detail={
+            "success": False, "error": "VERIFY_ERROR", "error_detail": str(e),
+        })
+
+
+@app.get("/db/sync-failures")
+async def db_get_sync_failures(
+    status: str = Query("pending,retrying,escalated", description="Comma-separated statuses to filter by"),
+):
+    """
+    Returns active sync failures matching any of the comma-separated statuses.
+    Used by Electron to find a failure record for a folder (to drive retries)
+    and by the renderer (via IPC) to populate the alarm banner.
+    """
+    from database import get_db
+
+    db = await get_db()
+    statuses = [s.strip() for s in status.split(",")]
+    placeholders = ",".join("?" * len(statuses))
+    cursor = await db.execute(
+        f"SELECT * FROM sync_failures WHERE status IN ({placeholders}) ORDER BY first_detected_at DESC",
+        statuses,
+    )
+    rows = await cursor.fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.post("/db/sync-retry/{failure_id}")
+async def db_sync_retry(failure_id: int):
+    """
+    Increments the retry counter for a failure. Returns whether Electron
+    should attempt another re-sync (retry=True) or stop and surface the
+    alarm (escalate=True, with the bundled report).
+    """
+    try:
+        result = await sync_reliability.attempt_retry(failure_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("Sync retry error: %s", e)
+        raise HTTPException(status_code=500, detail={
+            "success": False, "error": "RETRY_ERROR", "error_detail": str(e),
+        })
+
+
+@app.post("/db/sync-resolve/{failure_id}")
+async def db_sync_resolve(failure_id: int):
+    """Called by Electron once a retry's verify-sync call comes back is_match=true."""
+    await sync_reliability.mark_resolved(failure_id)
+    return {"success": True}
+
+
+@app.post("/db/sync-escalate/{failure_id}")
+async def db_sync_escalate(failure_id: int):
+    """
+    The one-click 'Send to Deepseek' action triggered from the alarm banner.
+    NOTE: currently raises NotImplementedError via send_to_deepseek() until
+    the actual Deepseek HTTP call is wired in (see sync_reliability.py's
+    send_to_deepseek stub) — intentional, so no API tokens are spent before
+    that's confirmed working end to end. Surfaces as a 501 to the renderer,
+    which can show "Not configured yet" instead of a generic error.
+    """
+    try:
+        from config import DEEPSEEK_API_KEY, DEEPSEEK_API_URL
+        result = await sync_reliability.send_to_deepseek(
+            failure_id, DEEPSEEK_API_KEY, DEEPSEEK_API_URL
+        )
+        fix_id = await sync_reliability.record_learned_fix(failure_id, result)
+        applied = await sync_reliability.apply_learned_fix(fix_id)
+        return {"success": True, "fix_id": fix_id, "applied": applied}
+    except NotImplementedError as e:
+        raise HTTPException(status_code=501, detail=str(e))
+    except Exception as e:
+        logger.error("Deepseek escalation error: %s", e)
+        raise HTTPException(status_code=500, detail={
+            "success": False, "error": "ESCALATE_ERROR", "error_detail": str(e),
+        })
 
 
 # ── Run ──
