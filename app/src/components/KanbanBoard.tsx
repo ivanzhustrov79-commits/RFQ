@@ -19,6 +19,7 @@ export function KanbanBoard() {
 
   const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
   const [overrideLoading, setOverrideLoading] = useState<string | null>(null); // messageId being overridden
+  const [escalating, setEscalating] = useState(false);
 
   const handleCardClick = useCallback((email: Email) => {
     setSelectedEmail(prev => prev?.id === email.id ? null : email);
@@ -86,6 +87,96 @@ export function KanbanBoard() {
     }
   }, [contextMenu, dispatch]);
 
+  // Mirrors handleStepOverride exactly — same optimistic-update/PATCH/rollback
+  // shape, but for signal_type. Lets you correct a wrong green/yellow without
+  // going through BOOST, and feeds the correction into learned_rules either way.
+  const handleSignalOverride = useCallback(async (newSignalType: 'advances' | 'holds' | 'neutral') => {
+    const email = contextMenu?.email;
+    if (!email) return;
+    setContextMenu(null);
+
+    const previousSignalType = email.signalType ?? 'neutral';
+    if (previousSignalType === newSignalType) return; // no-op
+
+    setOverrideLoading(email.messageId);
+
+    dispatch({
+      type: 'OVERRIDE_EMAIL_SIGNAL',
+      payload: { messageId: email.messageId, newSignalType },
+    });
+
+    setSelectedEmail(prev =>
+      prev?.messageId === email.messageId
+        ? { ...prev, signalType: newSignalType, needsReview: false }
+        : prev
+    );
+
+    try {
+      const res = await fetch('http://127.0.0.1:8721/db/email/signal', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message_id: email.messageId,
+          new_signal_type: newSignalType,
+          previous_signal_type: previousSignalType,
+        }),
+      });
+      if (!res.ok) {
+        console.warn('[OVERRIDE] Signal override failed:', await res.text());
+        dispatch({
+          type: 'OVERRIDE_EMAIL_SIGNAL',
+          payload: { messageId: email.messageId, newSignalType: previousSignalType },
+        });
+      }
+    } catch (err) {
+      console.warn('[OVERRIDE] Signal override network error:', err);
+      dispatch({
+        type: 'OVERRIDE_EMAIL_SIGNAL',
+        payload: { messageId: email.messageId, newSignalType: previousSignalType },
+      });
+    } finally {
+      setOverrideLoading(null);
+    }
+  }, [contextMenu, dispatch]);
+
+  // Manual trigger for the qwen-first/BOOST-second loop: sends only the
+  // CURRENTLY-FLAGGED emails in the selected thread to BOOST. Never automatic
+  // — this is the deliberate "I'm calling API support now" action.
+  const handleEscalateToBoost = useCallback(async () => {
+    if (!state.selectedThreadId) return;
+    setEscalating(true);
+    try {
+      const res = await fetch(`http://127.0.0.1:8721/db/needs-review/${state.selectedThreadId}/escalate`, {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        console.warn('[BOOST-ESCALATE] Failed:', data?.detail || res.statusText);
+        alert(`Escalation failed: ${data?.detail || res.statusText}`);
+        return;
+      }
+      console.log(`[BOOST-ESCALATE] ${data.emails_updated}/${data.emails_sent} updated, ${data.corrections_logged} corrections logged`);
+      // Re-fetch the thread so updated step/signal/needsReview values reflect
+      // BOOST's verified result, rather than going stale until next reselect.
+      const threadRes = await fetch(`http://127.0.0.1:8721/db/thread/${state.selectedThreadId}`);
+      const threadData = await threadRes.json();
+      const emails: Email[] = (threadData.emails || []).map((e: any) => ({
+        ...filteredEmails.find(fe => fe.messageId === e.message_id),
+        messageId: e.message_id,
+        stepAssigned: e.step_assigned ?? 0,
+        signalType: e.signal_type ?? null,
+        needsReview: !!e.needs_review,
+      }));
+      dispatch({ type: 'SET_THREAD_EMAILS', payload: emails });
+      dispatch({ type: 'SET_STEP_COLORS', payload: threadData.step_colors || {} });
+    } catch (err) {
+      console.warn('[BOOST-ESCALATE] Network error:', err);
+      alert('Escalation failed — network error');
+    } finally {
+      setEscalating(false);
+    }
+  }, [state.selectedThreadId, filteredEmails, dispatch]);
+
   const emailsByStep = workflowSteps.map(step => ({
     step,
     emails: filteredEmails.filter(e => e.stepAssigned === step.id),
@@ -126,6 +217,27 @@ export function KanbanBoard() {
             Clear filter
           </button>
         )}
+
+        {/* Manual qwen-first/BOOST-second escalation — only shown when the
+            selected thread actually has something flagged. Never automatic. */}
+        {state.selectedThreadId && filteredEmails.some(e => e.needsReview) && (
+          <button
+            onClick={handleEscalateToBoost}
+            disabled={escalating}
+            className="ml-auto text-micro px-2.5 py-1 rounded-full font-medium transition-opacity"
+            style={{
+              backgroundColor: 'var(--amber-alert)',
+              color: 'black',
+              opacity: escalating ? 0.6 : 1,
+              cursor: escalating ? 'default' : 'pointer',
+            }}
+            title="Send this thread's flagged emails to BOOST for verification"
+          >
+            {escalating
+              ? 'Sending to BOOST…'
+              : `${filteredEmails.filter(e => e.needsReview).length} need review — Send to BOOST`}
+          </button>
+        )}
       </div>
 
       <div key={`board-${state.selectedThreadId ?? state.selectedSupplierId ?? 'all'}`} className="flex-1 flex overflow-x-auto overflow-y-hidden custom-scrollbar px-2 pb-2 gap-2">
@@ -143,6 +255,24 @@ export function KanbanBoard() {
               }}
             >
               <div className="flex items-center gap-2">
+                {/* Step-color redesign: green = step's success condition met,
+                    yellow = has emails but no signal yet (or an explicit hold),
+                    white (no dot shown) = empty, or PR (which never participates
+                    in this system at all) — see database.compute_step_color. */}
+                {(() => {
+                  const color = state.stepColors[String(step.id)];
+                  if (color !== 'green' && color !== 'yellow') return null;
+                  return (
+                    <span
+                      className="shrink-0 w-2.5 h-2.5 rounded-full"
+                      title={color === 'green' ? 'Confirmed' : 'No signal yet / on hold'}
+                      style={{
+                        backgroundColor: color === 'green' ? 'var(--green-success)' : 'var(--amber-alert)',
+                        opacity: 0.9,
+                      }}
+                    />
+                  );
+                })()}
                 <span className="text-h2 font-semibold" style={{ color: 'var(--text-primary)' }}>{step.stepName}</span>
                 <span
                   className="text-micro font-semibold px-1.5 py-0.5 rounded-full"
@@ -239,6 +369,50 @@ export function KanbanBoard() {
                 </button>
               );
             })}
+
+            {/* Signal override — PR (step 0) never participates in the
+                signal system, so this section is hidden entirely for it. */}
+            {currentStep !== 0 && (
+              <>
+                <div className="px-3 py-1.5 mt-1" style={{ borderTop: '1px solid var(--border-color)', borderBottom: '1px solid var(--border-color)' }}>
+                  <p className="text-micro uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+                    Signal
+                  </p>
+                </div>
+                {([
+                  { value: 'advances' as const, label: 'Confirms this step', color: 'var(--green-success)' },
+                  { value: 'holds' as const, label: 'Hold / postponed', color: 'var(--amber-alert)' },
+                  { value: 'neutral' as const, label: 'No signal', color: 'var(--text-tertiary)' },
+                ]).map((opt) => {
+                  const isCurrentSignal = (contextMenu?.email?.signalType ?? 'neutral') === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      className="w-full text-left px-3 py-1.5 flex items-center gap-2 transition-colors"
+                      style={{
+                        color: isCurrentSignal ? 'var(--text-tertiary)' : 'var(--text-secondary)',
+                        backgroundColor: isCurrentSignal ? 'rgba(128,128,128,0.08)' : 'transparent',
+                        cursor: isCurrentSignal ? 'default' : 'pointer',
+                      }}
+                      disabled={isCurrentSignal}
+                      onClick={() => !isCurrentSignal && handleSignalOverride(opt.value)}
+                      onMouseEnter={(e) => {
+                        if (!isCurrentSignal) e.currentTarget.style.backgroundColor = 'rgba(73,40,96,0.3)';
+                      }}
+                      onMouseLeave={(e) => {
+                        if (!isCurrentSignal) e.currentTarget.style.backgroundColor = 'transparent';
+                      }}
+                    >
+                      <span className="shrink-0 w-2.5 h-2.5 rounded-full" style={{ backgroundColor: opt.color }} />
+                      <span className="text-body">{opt.label}</span>
+                      {isCurrentSignal && (
+                        <span className="ml-auto text-micro" style={{ color: 'var(--text-tertiary)' }}>current</span>
+                      )}
+                    </button>
+                  );
+                })}
+              </>
+            )}
           </div>
         </>
       )}

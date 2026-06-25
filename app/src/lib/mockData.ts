@@ -1,12 +1,10 @@
 import type { Supplier, RFQ, Email, Alarm, Exception, PartNumber, WorkflowStep, ComponentStatus, KpiData } from '@/types';
 
 export const workflowSteps: WorkflowStep[] = [
-  { id: 0, stepKey: 'PR', stepName: 'Purchase Request', displayOrder: 0, expectedDays: 3, gradientFrom: '#3498DB', gradientTo: '#2980B9' },
-  { id: 1, stepKey: 'RFQ_SENT', stepName: 'RFQ Sent', displayOrder: 1, expectedDays: 7, gradientFrom: '#9B5BAF', gradientTo: '#7B3F9B' },
-  { id: 2, stepKey: 'RFQ_RECEIVED', stepName: 'RFQ Received', displayOrder: 2, expectedDays: 5, gradientFrom: '#2ECC71', gradientTo: '#27AE60' },
-  { id: 3, stepKey: 'NEGOTIATION', stepName: 'Negotiation', displayOrder: 3, expectedDays: 14, gradientFrom: '#F5A623', gradientTo: '#E8941F' },
-  { id: 4, stepKey: 'CI', stepName: 'CI / Invoice', displayOrder: 4, expectedDays: 7, gradientFrom: '#E67E22', gradientTo: '#D35400' },
-  { id: 5, stepKey: 'CI_APPROVED', stepName: 'CI Approved', displayOrder: 5, expectedDays: 3, gradientFrom: '#2ECC71', gradientTo: '#1ABC9C' },
+  { id: 0, stepKey: 'PR', stepName: 'PR', displayOrder: 0, expectedDays: 3, gradientFrom: '#3498DB', gradientTo: '#2980B9' },
+  { id: 1, stepKey: 'RFQ', stepName: 'RFQ', displayOrder: 1, expectedDays: 7, gradientFrom: '#9B5BAF', gradientTo: '#7B3F9B' },
+  { id: 2, stepKey: 'CI', stepName: 'CI', displayOrder: 2, expectedDays: 10, gradientFrom: '#E67E22', gradientTo: '#D35400' },
+  { id: 3, stepKey: 'DOWNPAYMENT', stepName: 'Downpayment', displayOrder: 3, expectedDays: 5, gradientFrom: '#16A085', gradientTo: '#0E6655' },
 ];
 
 export const suppliers: Supplier[] = [

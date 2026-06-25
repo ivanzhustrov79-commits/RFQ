@@ -30,6 +30,8 @@ export interface Email {
     confidence: number;
   };
   supplierName?: string;
+  signalType?: 'advances' | 'holds' | 'neutral' | null;  // step-color redesign
+  needsReview?: boolean;  // qwen flagged this for review — eligible for BOOST escalation or manual override
 }
 
 export interface Supplier { id: string; name: string; logo: string; country: string; rating: number; kpi: any; }
@@ -57,10 +59,19 @@ export interface RfqNameEntry {
 }
 
 function statusFromStep(step: number): 'Open' | 'Pending' | 'Approved' | 'Closed' {
+  // New 4-step taxonomy (0=PR, 1=RFQ, 2=CI, 3=Downpayment) replaces the old
+  // 6-step thresholds (old: step<=1 Open, step<=4 Pending, step>=5 Approved
+  // — the >=5 branch is now unreachable since max step is 3, which is the
+  // bug this replaces).
+  // NOTE: this is still a rough step-NUMBER approximation. A more accurate
+  // status would use the step's actual green/yellow color (e.g. "Approved"
+  // should really mean the CI step is green — confirmed, not just "step
+  // number reached 3") — but that needs per-thread color data plumbed into
+  // wherever this is called (currently only has the raw step number).
+  // Revisit once that matters enough to wire through.
   if (step <= 1) return 'Open';
-  if (step <= 4) return 'Pending';
-  if (step >= 5) return 'Approved';
-  return 'Open';
+  if (step === 2) return 'Pending';
+  return 'Approved'; // step 3 (Downpayment)
 }
 
 export interface Alarm { id: string; rfqId: string; type: string; message: string; timestamp: string; dismissed: boolean; }
@@ -97,6 +108,7 @@ interface AppState {
   nlpStats: { pending: number; processing: number; completed: number; failed: number };
   // ── NEW ──
   rfqNames: Record<string, RfqNameEntry>; // keyed by `supplier-${supplierId}`
+  stepColors: Record<string, string>; // step (as string key) -> 'green'|'yellow'|'white', for the currently-selected thread
 }
 
 type Action =
@@ -132,7 +144,9 @@ type Action =
   | { type: 'APPLY_SUPPLIER_MAP'; payload: Record<string, { supplier_id: number; step_assigned: number }> }
   // ── NEW ──
   | { type: 'SET_RFQ_NAME'; payload: { supplierId: number; name: string; source: 'ai' | 'manual' } }
-  | { type: 'OVERRIDE_EMAIL_STEP'; payload: { messageId: string; newStep: number } };
+  | { type: 'OVERRIDE_EMAIL_STEP'; payload: { messageId: string; newStep: number } }
+  | { type: 'OVERRIDE_EMAIL_SIGNAL'; payload: { messageId: string; newSignalType: 'advances' | 'holds' | 'neutral' } }
+  | { type: 'SET_STEP_COLORS'; payload: Record<string, string> };
 
 const initialState: AppState = {
   theme: 'dark', fontSize: 'medium', useRealData: false,
@@ -150,6 +164,7 @@ const initialState: AppState = {
   troubleshootChat: [], aiMode: 'off', componentStatuses: [], troubleshootTarget: null, hiddenAccounts: new Set(),
   nlpStats: { pending: 0, processing: 0, completed: 0, failed: 0 },
   rfqNames: {},
+  stepColors: {},
 };
 
 function appReducer(state: AppState, action: Action): AppState {
@@ -268,6 +283,18 @@ function appReducer(state: AppState, action: Action): AppState {
         ),
       };
     }
+    case 'OVERRIDE_EMAIL_SIGNAL': {
+      const { messageId, newSignalType } = action.payload;
+      return {
+        ...state,
+        emails: state.emails.map(e =>
+          e.messageId === messageId
+            ? { ...e, signalType: newSignalType, needsReview: false }
+            : e
+        ),
+      };
+    }
+    case 'SET_STEP_COLORS': return { ...state, stepColors: action.payload };
     default: return state;
   }
 }
@@ -472,8 +499,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 isLowConfidence: false, isProvisional: false,
                 extracted: { supplier: null, partNumbers: [] },
                 classification: { step: e.step_assigned ?? 0, confidence: 0 },
+                signalType: e.signal_type ?? null,
+                needsReview: !!e.needs_review,
               }));
               dispatch({ type: 'SET_THREAD_EMAILS', payload: emails });
+              if (d.step_colors) dispatch({ type: 'SET_STEP_COLORS', payload: d.step_colors });
             });
         }
         // Always refresh thread list counts
@@ -504,6 +534,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!state.selectedThreadId) {
       dispatch({ type: 'CLEAR_EMAILS' });
+      dispatch({ type: 'SET_STEP_COLORS', payload: {} });
       return;
     }
     fetch(`http://127.0.0.1:8721/db/thread/${state.selectedThreadId}`)
@@ -542,9 +573,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
               step: e.step_assigned ?? 0,
               confidence,
             },
+            signalType: e.signal_type ?? null,
+            needsReview: !!e.needs_review,
           };
         });
         dispatch({ type: 'SET_THREAD_EMAILS', payload: emails });
+        dispatch({ type: 'SET_STEP_COLORS', payload: d.step_colors || {} });
       })
       .catch(() => dispatch({ type: 'CLEAR_EMAILS' }));
   }, [state.selectedThreadId]);

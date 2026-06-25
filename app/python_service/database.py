@@ -677,6 +677,9 @@ async def save_nlp_result(email_id: int, result: Dict[str, Any]) -> None:
     signal_type = result.get("signal_type", "neutral")
     if signal_type not in ("advances", "holds", "neutral"):
         signal_type = "neutral"
+    signal_confidence = result.get("signal_confidence", 0.5)
+    if not isinstance(signal_confidence, (int, float)):
+        signal_confidence = 0.5
 
     if step is not None and isinstance(step, int) and 0 <= step <= 3:
         await db.execute("""
@@ -685,18 +688,20 @@ async def save_nlp_result(email_id: int, result: Dict[str, Any]) -> None:
                 nlp_result = ?,
                 nlp_enriched_at = datetime('now'),
                 step_assigned = ?,
-                signal_type = ?
+                signal_type = ?,
+                signal_confidence = ?
             WHERE id = ?
-        """, (json.dumps(result), step, signal_type, email_id))
+        """, (json.dumps(result), step, signal_type, signal_confidence, email_id))
     else:
         await db.execute("""
             UPDATE emails SET
                 nlp_status = 'completed',
                 nlp_result = ?,
                 nlp_enriched_at = datetime('now'),
-                signal_type = ?
+                signal_type = ?,
+                signal_confidence = ?
             WHERE id = ?
-        """, (json.dumps(result), signal_type, email_id))
+        """, (json.dumps(result), signal_type, signal_confidence, email_id))
     await db.commit()
 
     # Part-number reconciliation runs AFTER the main save, since part numbers
@@ -1113,6 +1118,35 @@ async def get_boss_addresses() -> set:
     return set(r["email"].lower() for r in rows)
 
 
+async def list_boss_addresses() -> List[Dict[str, Any]]:
+    """Returns boss_addresses rows (id + email) for the Supplier pane's Boss
+    card — needs row ids so individual entries can be deleted."""
+    db = await get_db()
+    cursor = await db.execute("SELECT id, email FROM boss_addresses ORDER BY email")
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def add_boss_address(email: str) -> bool:
+    """Adds one Boss email address. Returns False if it already exists
+    (UNIQUE constraint) rather than raising — same idempotent-friendly
+    pattern as add_supplier_contact_email."""
+    db = await get_db()
+    try:
+        await db.execute("INSERT INTO boss_addresses (email) VALUES (?)", (email.lower().strip(),))
+        await db.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+async def remove_boss_address(email: str) -> bool:
+    """Removes one Boss email address. Returns False if it didn't exist."""
+    db = await get_db()
+    await db.execute("DELETE FROM boss_addresses WHERE email = ?", (email.lower().strip(),))
+    await db.commit()
+    return db.total_changes > 0
+
+
 def determine_sender_role(
     sender_email: str, account_email: Optional[str],
     supplier_id: Optional[int], boss_emails: set,
@@ -1147,6 +1181,72 @@ def determine_sender_role(
         return "supplier"
 
     return "unknown"
+
+
+async def run_migration_009():
+    """Migration 009: externally_verified flag on learned_rules.
+
+    Closes a real gap: previously, a rule could be promoted to 'active'
+    (the status that actually gets injected into qwen's prompts, via
+    get_active_rules) purely from internal self-consistency — qwen
+    repeatedly agreeing with itself (reinforce_if_matching) or a strong
+    historical pattern (bootstrap_rules.py). Neither of those involves
+    BOOST or the user at all. If qwen is confidently and consistently
+    WRONG about something, that looks identical from inside the system to
+    being confidently and consistently right — both produce the same
+    signal (high confidence, high agreement). Confident mistakes are also
+    the LEAST likely to ever get flagged for review, since needs_review is
+    gated on low confidence — so this loophole would have made wrong
+    patterns reinforce themselves indefinitely, undetected.
+
+    After this migration: a rule can only reach 'active' status if
+    externally_verified = 1, which is set automatically by record_correction
+    (BOOST escalation or manual override touching a matching email) or
+    explicitly via the new /db/learned-rules/{id}/approve endpoint. Pure
+    self-reinforcement and bootstrap mining can still build up a strong
+    candidate's confidence, but can no longer promote it past 'candidate'
+    on their own — something external has to vouch for it first.
+
+    Existing 'active' rules created before this migration are NOT
+    retroactively re-checked or demoted — consistent with this app's
+    non-retroactive principle throughout. They're grandfathered in as-is.
+    """
+    db = await get_db()
+    cursor = await db.execute("PRAGMA table_info(learned_rules)")
+    columns = [row["name"] for row in await cursor.fetchall()]
+
+    if "externally_verified" not in columns:
+        logger.info("Applying migration 009: adding externally_verified to learned_rules")
+        await db.execute("ALTER TABLE learned_rules ADD COLUMN externally_verified INTEGER DEFAULT 0")
+        # Grandfather existing active rules — they were promoted under the
+        # old rules; this migration only changes the gate for FUTURE
+        # promotions, not a retroactive audit of what's already trusted.
+        await db.execute("UPDATE learned_rules SET externally_verified = 1 WHERE status = 'active'")
+        await db.commit()
+        logger.info("Migration 009 applied successfully")
+    else:
+        logger.debug("Migration 009 already applied")
+
+
+async def run_migration_008():
+    """Migration 008: signal_confidence column, separate from signal_type.
+    Lets the learning tool mine signal_classification patterns directly via
+    SQL (mirroring how significance_confidence already works alongside
+    is_significant), and lets the background worker apply a STRICTER
+    needs_review threshold specifically for signal calls — a wrong
+    'advances' is stickier/more consequential than a wrong step, since it
+    flips a whole column green and stays flipped until corrected."""
+    db = await get_db()
+    cursor = await db.execute("PRAGMA table_info(emails)")
+    columns = [row["name"] for row in await cursor.fetchall()]
+
+    if "signal_confidence" not in columns:
+        logger.info("Applying migration 008: adding signal_confidence column")
+        await db.execute("ALTER TABLE emails ADD COLUMN signal_confidence REAL")
+        await db.commit()
+        logger.info("Migration 008 applied successfully")
+    else:
+        logger.debug("Migration 008 already applied")
 
 
 async def run_migration_007():

@@ -70,6 +70,12 @@ export function SupplierPane() {
   const [newSupplierName, setNewSupplierName] = useState('');
   const [newSupplierEmail, setNewSupplierEmail] = useState('');
   const [savingSupplier, setSavingSupplier] = useState(false);
+  // ── Boss card (global config, not per-supplier — mirrors the Accounts section below) ──
+  const [bossAddresses, setBossAddresses] = useState([]);
+  const [bossExpanded, setBossExpanded] = useState(true);
+  const [addingBoss, setAddingBoss] = useState(false);
+  const [newBossEmail, setNewBossEmail] = useState('');
+  const [savingBoss, setSavingBoss] = useState(false);
 
   useEffect(() => {
     const api = window.electronAPI;
@@ -78,6 +84,16 @@ export function SupplierPane() {
       if (result?.accounts) setAccounts(result.accounts);
     }).catch(() => {});
   }, []);
+
+  const refreshBossAddresses = async () => {
+    try {
+      const res = await fetch('http://127.0.0.1:8721/db/boss-addresses');
+      const data = await res.json();
+      if (data?.addresses) setBossAddresses(data.addresses);
+    } catch (err) { console.error('[BOSS] Failed to load addresses:', err); }
+  };
+
+  useEffect(() => { refreshBossAddresses(); }, []);
 
   const handleSelectSupplier = (id) => {
     const isAlreadySelected = state.selectedSupplierId === id;
@@ -88,7 +104,24 @@ export function SupplierPane() {
   const toggleSupplierSync = (e, supplierId) => {
     e.stopPropagation();
     const current = state.supplierSyncEnabled[supplierId] !== false;
+    const turningOn = current === false; // was off, now being switched on
     dispatch({ type: 'SET_SUPPLIER_SYNC', payload: { supplierId, enabled: !current } });
+
+    if (turningOn) {
+      // Targeted resync: re-scans all folders, but NLP-queueing is scoped to
+      // just this supplier + Boss (see main.js's syncSpecificSupplier) — so
+      // catching this one supplier up never burns qwen time on the rest of
+      // the already-tracked suppliers' history.
+      window.electronAPI?.thunderbird?.syncSupplier?.(supplierId)
+        .then((result) => {
+          if (result?.success) {
+            console.log(`[SYNC] Targeted resync for supplier ${supplierId}: ${result.emailsScanned} emails scanned`);
+          } else {
+            console.error('[SYNC] Targeted resync failed:', result?.error);
+          }
+        })
+        .catch((err) => console.error('[SYNC] Targeted resync error:', err));
+    }
   };
 
   const toggleAccount = (accountName) => {
@@ -129,6 +162,33 @@ export function SupplierPane() {
     } catch (err) { console.error(err); }
   };
 
+  const handleAddBoss = async () => {
+    const email = newBossEmail.trim().toLowerCase();
+    if (!email.includes('@') || !email.includes('.')) { alert('Enter a full email address'); return; }
+    setSavingBoss(true);
+    try {
+      const res = await fetch('http://127.0.0.1:8721/db/boss-addresses', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setNewBossEmail(''); setAddingBoss(false);
+      await refreshBossAddresses();
+    } catch (err) { console.error(err); } finally { setSavingBoss(false); }
+  };
+
+  const handleDeleteBoss = async (email) => {
+    if (!confirm(`Remove "${email}" from Boss addresses?`)) return;
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:8721/db/boss-addresses?email=${encodeURIComponent(email)}`,
+        { method: 'DELETE' }
+      );
+      if (!res.ok) throw new Error(await res.text());
+      await refreshBossAddresses();
+    } catch (err) { console.error(err); }
+  };
+
   const handleAddSupplier = async () => {
     const name = newSupplierName.trim();
     const email = newSupplierEmail.trim().toLowerCase();
@@ -150,6 +210,12 @@ export function SupplierPane() {
         });
       }
       setNewSupplierName(''); setNewSupplierEmail(''); setAddingSupplier(false);
+      if (result.supplier_id) {
+        // Default new suppliers to sync-OFF. This keeps exactly one trigger
+        // for syncSpecificSupplier (the toggle click) — whether the supplier
+        // is brand new or just being re-enabled, the action is the same.
+        dispatch({ type: 'SET_SUPPLIER_SYNC', payload: { supplierId: result.supplier_id, enabled: false } });
+      }
       await refreshSuppliers();
     } catch (err) { console.error(err); } finally { setSavingSupplier(false); }
   };
@@ -352,6 +418,56 @@ export function SupplierPane() {
                     </button>
                   );
                 })}
+            </div>
+          )}
+        </div>
+
+        {/* ── Boss card: global config (one set, not per-supplier) — used by the
+             backend's determine_sender_role to recognize Boss<->user correspondence
+             for the PR step and the Downpayment "Boss -> me" condition. ── */}
+        <div style={{ borderTop: '1px solid var(--border-color)' }}>
+          <button onClick={() => setBossExpanded(p => !p)} className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/5 transition-colors">
+            <User className="w-3.5 h-3.5 shrink-0" style={{ color: 'var(--plum-accent)' }} />
+            <span className="text-small font-medium flex-1 text-left" style={{ color: 'var(--text-secondary)' }}>Boss</span>
+            <span className="text-micro font-semibold px-1.5 py-0.5 rounded-full" style={{ backgroundColor: 'var(--brand-plum)', color: 'white' }}>
+              {bossAddresses.length}
+            </span>
+            {bossExpanded ? <ChevronDown className="w-3 h-3" style={S} /> : <ChevronRight className="w-3 h-3" style={S} />}
+          </button>
+          {bossExpanded && (
+            <div className="px-3 pb-2">
+              {bossAddresses.length === 0 ? (
+                <p className="text-micro italic mb-1" style={S}>None — add Boss's email below</p>
+              ) : (
+                bossAddresses.map((b) => (
+                  <div key={b.id} className="flex items-center gap-1 mb-0.5 group/boss">
+                    <span className="text-micro px-1 py-0.5 rounded flex-1 truncate" style={{ backgroundColor: 'rgba(107,61,139,0.2)', color: 'var(--plum-accent)', fontFamily: 'monospace' }} title={b.email}>
+                      {b.email}
+                    </span>
+                    <button
+                      onClick={() => handleDeleteBoss(b.email)}
+                      className="shrink-0 opacity-0 group-hover/boss:opacity-100 transition-opacity hover:opacity-80"
+                      title="Remove"
+                    >
+                      <X className="w-3 h-3" style={{ color: 'var(--red-urgent)' }} />
+                    </button>
+                  </div>
+                ))
+              )}
+              {addingBoss ? (
+                <div className="flex items-center gap-1 mt-1">
+                  <input autoFocus value={newBossEmail} onChange={e => setNewBossEmail(e.target.value)}
+                    onKeyDown={e => { e.stopPropagation(); if (e.key === 'Enter') handleAddBoss(); if (e.key === 'Escape') { setAddingBoss(false); setNewBossEmail(''); } }}
+                    placeholder="boss@company.com" className="flex-1 min-w-0 text-micro px-1.5 py-1 rounded outline-none"
+                    style={{ backgroundColor: 'var(--card-bg)', border: '1px solid var(--brand-plum)', color: 'var(--text-primary)', fontFamily: 'monospace' }} />
+                  <button onClick={handleAddBoss} disabled={savingBoss} className="shrink-0 text-micro px-1.5 py-1 rounded" style={{ backgroundColor: 'var(--brand-plum)', color: 'white', opacity: savingBoss ? 0.5 : 1 }}>{savingBoss ? '…' : 'Add'}</button>
+                  <button onClick={() => { setAddingBoss(false); setNewBossEmail(''); }} className="shrink-0"><X className="w-3 h-3" style={S} /></button>
+                </div>
+              ) : (
+                <button onClick={() => setAddingBoss(true)} className="flex items-center gap-1 mt-1 text-micro hover:opacity-80" style={{ color: 'var(--plum-accent)' }}>
+                  <Plus className="w-3 h-3" /> Add Boss email
+                </button>
+              )}
             </div>
           )}
         </div>

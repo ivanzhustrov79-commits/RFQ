@@ -17,7 +17,7 @@ from database import (
     queue_emails_for_nlp, get_next_nlp_pending, mark_nlp_processing,
     save_nlp_result, mark_nlp_failed, get_nlp_results, get_nlp_queue_stats,
     reset_stuck_processing, run_migration_004, run_migration_005, run_migration_006,
-    run_migration_007,
+    run_migration_007, run_migration_008, run_migration_009,
     get_supplier_id_by_sender, add_supplier_contact_email, get_supplier_contact_emails,
     run_migration_002, run_migration_003,
     reset_stuck_processing,
@@ -55,6 +55,8 @@ async def lifespan(app: FastAPI):
     await run_migration_005()
     await run_migration_006()
     await run_migration_007()
+    await run_migration_008()
+    await run_migration_009()
     await reset_stuck_processing()
     _start_time = time.time()
 
@@ -102,8 +104,14 @@ from pydantic import BaseModel
 
 class EmailStepOverrideRequest(BaseModel):
     message_id: str          # identifies which email
-    new_step: int            # 0–5
+    new_step: int            # 0-3 (PR/RFQ/CI/Downpayment)
     previous_step: int = 0  # AI-assigned step (for deviation logging)
+
+
+class EmailSignalOverrideRequest(BaseModel):
+    message_id: str
+    new_signal_type: str       # "advances" | "holds" | "neutral"
+    previous_signal_type: str = "neutral"
 
 
 class RfqNameRequest(BaseModel):
@@ -247,16 +255,18 @@ async def db_override_email_step(request: EmailStepOverrideRequest):
     Returns: { success: true, message_id, new_step, previous_step }
     """
     import json
+    import re as _re
     from database import get_db
+    from ai.rule_engine import record_correction
 
-    if not (0 <= request.new_step <= 5):
-        raise HTTPException(status_code=400, detail="new_step must be 0–5")
+    if not (0 <= request.new_step <= 3):
+        raise HTTPException(status_code=400, detail="new_step must be 0-3")
 
     db = await get_db()
 
     # Load existing nlp_result so we can preserve AI classification data
     cursor = await db.execute(
-        "SELECT nlp_result, step_assigned FROM emails WHERE message_id = ?",
+        "SELECT nlp_result, step_assigned, subject, supplier_id FROM emails WHERE message_id = ?",
         (request.message_id,)
     )
     row = await cursor.fetchone()
@@ -291,6 +301,18 @@ async def db_override_email_step(request: EmailStepOverrideRequest):
     """, (request.new_step, json.dumps(updated_result), request.message_id))
     await db.commit()
 
+    # Feed the learning loop — a manual correction is just as valid a signal
+    # as a BOOST correction; without this, qwen could only ever learn from
+    # BOOST, never from you directly catching something it got wrong.
+    if request.new_step != request.previous_step:
+        keywords = _re.findall(r'[a-zа-я0-9]{4,}', (row["subject"] or "").lower())[:10]
+        if keywords:
+            await record_correction(
+                db, request.message_id, "step_classification", f"step={request.new_step}",
+                keywords, row["supplier_id"], str(request.previous_step), str(request.new_step),
+                source="user_manual", reason="manual step override",
+            )
+
     logger.info(
         "[OVERRIDE] %s: step %d → %d (was AI=%d)",
         request.message_id[:30],
@@ -304,6 +326,70 @@ async def db_override_email_step(request: EmailStepOverrideRequest):
         "message_id": request.message_id,
         "new_step": request.new_step,
         "previous_step": request.previous_step,
+    }
+
+
+@app.patch("/db/email/signal")
+async def db_override_email_signal(request: EmailSignalOverrideRequest):
+    """
+    Manual signal_type override — the analogue of /db/email/step, but for
+    the green/yellow/white status signal instead of the workflow step.
+
+    This exists specifically because, until now, the learning loop only ever
+    had ONE source of truth for signal_type corrections: BOOST. A wrong
+    "advances"/"holds" call that you noticed yourself (without escalating to
+    BOOST) had no way to correct the email OR teach qwen anything from it.
+    This route does both, mirroring /db/email/step's pattern exactly.
+    """
+    import re as _re
+    from database import get_db
+    from ai.rule_engine import record_correction
+
+    if request.new_signal_type not in ("advances", "holds", "neutral"):
+        raise HTTPException(status_code=400, detail="new_signal_type must be advances, holds, or neutral")
+
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT subject, supplier_id, step_assigned FROM emails WHERE message_id = ?",
+        (request.message_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Email not found")
+
+    if row["step_assigned"] == 0:
+        raise HTTPException(status_code=400, detail="PR (step 0) never participates in the signal system")
+
+    await db.execute("""
+        UPDATE emails SET
+            signal_type = ?, signal_confidence = 1.0,
+            nlp_status = 'manual'
+        WHERE message_id = ?
+    """, (request.new_signal_type, request.message_id))
+    await db.commit()
+
+    if request.new_signal_type != request.previous_signal_type:
+        keywords = _re.findall(r'[a-zа-я0-9]{4,}', (row["subject"] or "").lower())[:10]
+        if keywords:
+            step = row["step_assigned"]
+            await record_correction(
+                db, request.message_id, "signal_classification",
+                f"step={step},signal={request.new_signal_type}",
+                keywords, row["supplier_id"],
+                request.previous_signal_type, request.new_signal_type,
+                source="user_manual", reason="manual signal override",
+            )
+
+    logger.info(
+        "[OVERRIDE] %s: signal %s -> %s",
+        request.message_id[:30], request.previous_signal_type, request.new_signal_type,
+    )
+
+    return {
+        "success": True,
+        "message_id": request.message_id,
+        "new_signal_type": request.new_signal_type,
+        "previous_signal_type": request.previous_signal_type,
     }
 
 @app.get("/db/email-supplier-map")
@@ -414,6 +500,45 @@ async def clear_email_caches():
     from database import _invalidate_email_caches
     _invalidate_email_caches()
     return {"success": True, "message": "Caches cleared"}
+
+
+@app.get("/db/boss-addresses")
+async def get_boss_addresses_route():
+    """List configured Boss email addresses — global config (one set, not
+    per-supplier), used by the SupplierPane's Boss card and by
+    database.determine_sender_role for PR/Downpayment classification."""
+    from database import list_boss_addresses
+    addresses = await list_boss_addresses()
+    return {"addresses": addresses}
+
+
+class AddBossAddressRequest(BaseModel):
+    email: str
+
+
+@app.post("/db/boss-addresses")
+async def add_boss_address_route(request: AddBossAddressRequest):
+    """Add a Boss email address."""
+    from database import add_boss_address
+    email = request.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Must be a full email address")
+    added = await add_boss_address(email)
+    if not added:
+        raise HTTPException(status_code=409, detail="Address already exists")
+    logger.info("[BOSS] Added address: %s", email)
+    return {"success": True, "email": email}
+
+
+@app.delete("/db/boss-addresses")
+async def delete_boss_address_route(email: str):
+    """Remove a Boss email address."""
+    from database import remove_boss_address
+    removed = await remove_boss_address(email)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Address not found")
+    logger.info("[BOSS] Removed address: %s", email)
+    return {"success": True, "deleted": email}
 
 
 @app.get("/db/supplier-contact-patterns")
@@ -677,6 +802,209 @@ async def get_needs_review():
     return {"threads": threads, "total_threads": len(threads)}
 
 
+@app.post("/db/needs-review/{thread_id}/escalate")
+async def escalate_thread_to_boost(thread_id: int):
+    """
+    One-click 'send to BOOST' action for a thread's needs_review emails.
+
+    This is the deliberate, manual half of the qwen-first/BOOST-second loop:
+    qwen handles everything autonomously using whatever learned_rules already
+    knows; whatever stays uncertain ('yellow'/needs_review) only gets sent to
+    BOOST when explicitly triggered here — NEVER automatically. BOOST's
+    result both corrects the flagged emails AND feeds learned_rules via the
+    existing record_correction mechanism, so qwen gets better at the SAME
+    pattern next time, without ever retroactively touching anything else.
+    """
+    from database import get_db, determine_sender_role, get_boss_addresses
+    from ai.boost_pipeline import verify_thread
+    from ai.rule_engine import record_correction
+    import re as _re
+
+    db = await get_db()
+
+    rows = await db.execute("""
+        SELECT id, message_id, subject, body_text, sender_email, account_email,
+               supplier_id, step_assigned, signal_type, signal_confidence,
+               is_significant, significance_confidence, sent_at
+        FROM emails
+        WHERE thread_id = ? AND needs_review = 1
+        ORDER BY sent_at ASC
+    """, (thread_id,))
+    flagged = [dict(r) for r in await rows.fetchall()]
+
+    if not flagged:
+        raise HTTPException(status_code=404, detail="No emails currently flagged for review in this thread")
+
+    # sender_role is deterministic (boss/user/supplier/unknown), not an LLM
+    # guess — BOOST needs it for the same directional signal judgment qwen
+    # already gets via classify_step_llm.
+    boss_emails = await get_boss_addresses()
+    for e in flagged:
+        e["sender_role"] = determine_sender_role(
+            e["sender_email"], e.get("account_email"), e.get("supplier_id"), boss_emails,
+        )
+
+    boost_results = await verify_thread(thread_id, flagged)
+    if not boost_results:
+        raise HTTPException(status_code=502, detail="BOOST API unavailable or returned no result")
+
+    by_message_id = {e["message_id"]: e for e in flagged}
+    applied = 0
+    corrections_logged = 0
+
+    def _keywords(subject):
+        return _re.findall(r'[a-zа-я0-9]{4,}', (subject or "").lower())[:10]
+
+    for entry in boost_results:
+        mid = entry.get("message_id")
+        prior = by_message_id.get(mid)
+        if not prior:
+            continue  # BOOST returned an id that doesn't match what we sent — skip, don't guess
+
+        new_step = entry.get("step", prior["step_assigned"])
+        new_signal = entry.get("signal_type", prior["signal_type"])
+        new_signal_conf = entry.get("signal_confidence", prior["signal_confidence"])
+        new_is_sig = entry.get("is_significant", prior["is_significant"])
+        new_sig_conf = entry.get("significance_confidence", prior["significance_confidence"])
+
+        # nlp_status='manual' protects this row from being silently overwritten
+        # by a future automatic re-sync — same protection a manual user
+        # override gets, since a deliberate BOOST escalation carries the same
+        # authority: you explicitly chose to verify this one.
+        await db.execute("""
+            UPDATE emails SET
+                step_assigned = ?, signal_type = ?, signal_confidence = ?,
+                is_significant = ?, significance_confidence = ?,
+                needs_review = 0, nlp_status = 'manual'
+            WHERE id = ?
+        """, (new_step, new_signal, new_signal_conf,
+              1 if new_is_sig else 0, new_sig_conf, prior["id"]))
+        applied += 1
+
+        keywords = _keywords(prior["subject"])
+        supplier_id = prior.get("supplier_id")
+
+        if new_step != prior["step_assigned"] and keywords:
+            await record_correction(
+                db, mid, "step_classification", f"step={new_step}", keywords,
+                supplier_id, str(prior["step_assigned"]), str(new_step),
+                source="boost_api", reason=entry.get("reason", ""),
+            )
+            corrections_logged += 1
+
+        if new_signal != prior["signal_type"] and keywords and new_step != 0:
+            await record_correction(
+                db, mid, "signal_classification", f"step={new_step},signal={new_signal}",
+                keywords, supplier_id, prior["signal_type"] or "neutral", new_signal,
+                source="boost_api", reason=entry.get("reason", ""),
+            )
+            corrections_logged += 1
+
+        if bool(new_is_sig) != bool(prior["is_significant"]) and keywords:
+            await record_correction(
+                db, mid, "significance", f"is_significant={bool(new_is_sig)}",
+                keywords, supplier_id, str(bool(prior["is_significant"])), str(bool(new_is_sig)),
+                source="boost_api", reason=entry.get("reason", ""),
+            )
+            corrections_logged += 1
+
+    await db.commit()
+
+    logger.info(
+        "[BOOST-ESCALATE] thread %d: %d/%d emails updated, %d corrections logged to learned_rules",
+        thread_id, applied, len(flagged), corrections_logged,
+    )
+
+    return {
+        "success": True,
+        "thread_id": thread_id,
+        "emails_sent": len(flagged),
+        "emails_updated": applied,
+        "corrections_logged": corrections_logged,
+    }
+
+
+@app.get("/db/learned-rules/pending-review")
+async def get_pending_rule_review():
+    """
+    Strong candidates that have never been externally verified — patterns
+    qwen has noticed entirely on its own (via bootstrap mining or repeated
+    self-agreement) that are statistically convincing enough to consider
+    promoting, but have never actually been confirmed by BOOST, a manual
+    override, or explicit review.
+
+    Per migration 009: these can NEVER reach 'active' status (and therefore
+    can never influence qwen's prompts) on self-consistency alone — that's
+    the whole point. This is the explicit, deliberate "is this actually
+    right?" queue for patterns that would otherwise sit as strong-but-
+    unverified candidates indefinitely, never helping qwen, simply because
+    they never happened to overlap with a flagged email.
+    """
+    from database import get_db
+    db = await get_db()
+    rows = await db.execute("""
+        SELECT * FROM learned_rules
+        WHERE status = 'candidate' AND externally_verified = 0
+          AND times_confirmed >= 3
+        ORDER BY confidence DESC
+    """)
+    rules = [dict(r) for r in await rows.fetchall()]
+    return {"rules": rules, "total": len(rules)}
+
+
+@app.post("/db/learned-rules/{rule_id}/approve")
+async def approve_pending_rule(rule_id: int):
+    """
+    Explicit human confirmation that a self-consistent candidate is
+    actually correct. Your direct say-so is sufficient on its own —
+    promotes straight to 'active' regardless of times_confirmed, since your
+    judgment IS the verification, no further repetition needed.
+    """
+    from database import get_db
+    db = await get_db()
+    cursor = await db.execute("SELECT * FROM learned_rules WHERE id = ?", (rule_id,))
+    rule = await cursor.fetchone()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+
+    await db.execute("""
+        UPDATE learned_rules SET externally_verified = 1, status = 'active',
+                                  last_updated_at = datetime('now')
+        WHERE id = ?
+    """, (rule_id,))
+    await db.execute("""
+        INSERT INTO rule_corrections (message_id, rule_id, correction_source, reason)
+        VALUES (?, ?, 'user_manual', 'explicit rule review: approved')
+    """, (f"rule_review:{rule_id}", rule_id))
+    await db.commit()
+    logger.info("[RULES] Rule #%d explicitly approved by user -> ACTIVE", rule_id)
+    return {"success": True, "rule_id": rule_id, "status": "active"}
+
+
+@app.post("/db/learned-rules/{rule_id}/reject")
+async def reject_pending_rule(rule_id: int):
+    """Explicit human rejection — retires the rule so it stops being
+    suggested for review and never gets revisited."""
+    from database import get_db
+    db = await get_db()
+    cursor = await db.execute("SELECT id FROM learned_rules WHERE id = ?", (rule_id,))
+    if not await cursor.fetchone():
+        raise HTTPException(status_code=404, detail="Rule not found")
+
+    await db.execute("""
+        UPDATE learned_rules SET status = 'retired', externally_verified = 1,
+                                  last_updated_at = datetime('now')
+        WHERE id = ?
+    """, (rule_id,))
+    await db.execute("""
+        INSERT INTO rule_corrections (message_id, rule_id, correction_source, reason)
+        VALUES (?, ?, 'user_manual', 'explicit rule review: rejected')
+    """, (f"rule_review:{rule_id}", rule_id))
+    await db.commit()
+    logger.info("[RULES] Rule #%d explicitly rejected by user -> RETIRED", rule_id)
+    return {"success": True, "rule_id": rule_id, "status": "retired"}
+
+
 @app.get("/db/thread-count")
 async def get_thread_count():
     """Get total thread count for settings display."""
@@ -866,7 +1194,7 @@ async def get_thread_detail(thread_id: int):
     rows = await db.execute("""
         SELECT message_id, subject, sender_email, sender_name,
                sent_at, step_assigned, nlp_status, nlp_result,
-               is_significant, significance_confidence
+               is_significant, significance_confidence, signal_type, needs_review
         FROM emails
         WHERE thread_id = ?
         ORDER BY sent_at ASC
@@ -913,16 +1241,46 @@ async def get_thread_detail(thread_id: int):
             else:
                 emails_list[idx]['sequence_position'] = 'discussion'
 
-    # Re-order for display: within each step, significant emails first (chronological
-    # among themselves), then non-significant ones (also chronological). The UI uses
-    # `is_significant` directly to render a visual gap between the two groups — no
-    # extra field needed, just sort order + the flag itself.
+    # Step colors (step-logic redesign, spec 3.2): for each step, the most
+    # recent advances/holds email decides green/yellow; no signal emails at
+    # all -> yellow ("no signal yet"); step has zero emails -> white. PR
+    # (step 0) never participates, always white. Computed inline from the
+    # already-fetched rows rather than calling database.compute_step_color,
+    # since that would re-query per step — this endpoint is hit on every
+    # thread selection, so staying at one query total matters.
+    STEP_NAMES_LOCAL = {0: "PR", 1: "RFQ", 2: "CI", 3: "Downpayment"}
+    step_colors: Dict[str, str] = {}
+    for step in range(4):
+        indices = step_groups.get(step, [])
+        if step == 0 or not indices:
+            step_colors[str(step)] = "white"
+            continue
+        signal_indices = [i for i in indices if emails_list[i].get('signal_type') in ('advances', 'holds')]
+        if not signal_indices:
+            step_colors[str(step)] = "yellow"
+            continue
+        most_recent = max(signal_indices, key=lambda i: emails_list[i]['sent_at'])
+        step_colors[str(step)] = "green" if emails_list[most_recent]['signal_type'] == 'advances' else "yellow"
+
+    # Re-order for display, two tiers layered together:
+    #   1. Signal stack first (advances/holds emails, MOST RECENT FIRST) — per
+    #      spec 3.3, these are the key status-determining emails and always
+    #      surface at the very top, regardless of significance.
+    #   2. Then the EXISTING significant/noise chronological tiering, applied
+    #      to whatever's left (unchanged from before this feature existed) —
+    #      this is exactly what spec 3.3 meant by "the existing default
+    #      chronological sort" for the remainder.
     display_order = []
     for step in sorted(step_groups.keys()):
         indices = step_groups[step]
-        significant_idx = [i for i in indices if emails_list[i].get('is_significant', 1)]
-        noise_idx = [i for i in indices if not emails_list[i].get('is_significant', 1)]
-        display_order.extend(significant_idx + noise_idx)
+        signal_idx = sorted(
+            (i for i in indices if emails_list[i].get('signal_type') in ('advances', 'holds')),
+            key=lambda i: emails_list[i]['sent_at'], reverse=True,
+        )
+        remaining = [i for i in indices if i not in signal_idx]
+        significant_idx = [i for i in remaining if emails_list[i].get('is_significant', 1)]
+        noise_idx = [i for i in remaining if not emails_list[i].get('is_significant', 1)]
+        display_order.extend(signal_idx + significant_idx + noise_idx)
 
     emails_list = [emails_list[i] for i in display_order]
 
@@ -932,7 +1290,9 @@ async def get_thread_detail(thread_id: int):
             "part_numbers": list(parts),
             "step_distribution": step_dist,
             "email_count": len(emails),
-        }
+        },
+        "step_colors": step_colors,
+        "step_names": STEP_NAMES_LOCAL,
     }
 
 
@@ -1136,7 +1496,12 @@ async def _nlp_background_worker():
                 _db = await get_db()
                 active_rules = await get_active_rules(_db, "step_classification", email.get("supplier_id"))
                 significance_rules = await get_active_rules(_db, "significance", email.get("supplier_id"))
-                rules_hint = format_rules_for_prompt(active_rules) + format_rules_for_prompt(significance_rules)
+                signal_rules = await get_active_rules(_db, "signal_classification", email.get("supplier_id"))
+                rules_hint = (
+                    format_rules_for_prompt(active_rules)
+                    + format_rules_for_prompt(significance_rules)
+                    + format_rules_for_prompt(signal_rules)
+                )
 
                 # Who actually sent this email — needed for the new directional
                 # step definitions (RFQ/CI/Downpayment "advances" conditions).
@@ -1241,6 +1606,7 @@ async def _nlp_background_worker():
                     "confidence": classification.get("confidence", 0),
                     "reason": classification.get("reason", ""),
                     "signal_type": classification.get("signal_type", "neutral"),
+                    "signal_confidence": classification.get("signal_confidence", 0.5),
                     "processing_time_ms": int(dt * 1000),
                     "needs_review": needs_review,
                     "suggested_thread_id": suggested_thread_id,
@@ -1261,6 +1627,32 @@ async def _nlp_background_worker():
                 logger.info("[BG-NLP] Email %d enriched in %.1fs: step=%d, supplier=%s, conf=%.2f, review=%s",
                             email_id, dt, result["step"], result["supplier_name"] or "-",
                             result["confidence"], needs_review)
+
+                # Continuous self-reinforcement — qwen's OWN agreement with an
+                # existing rule now counts for something in real time, not
+                # just in occasional bootstrap_rules.py batch runs. See
+                # rule_engine.reinforce_if_matching's docstring for why this
+                # is deliberately asymmetric (agreement only, never weakens
+                # a rule on disagreement — that's reserved for BOOST/manual).
+                from ai.rule_engine import reinforce_if_matching
+                import re as _re
+                _kw = _re.findall(r'[a-zа-я0-9]{4,}', (email["subject"] or "").lower())[:10]
+                if _kw:
+                    step_val = result["step"]
+                    await reinforce_if_matching(
+                        _db, email["message_id"], "step_classification", f"step={step_val}",
+                        _kw, email.get("supplier_id"), result["confidence"],
+                    )
+                    if step_val != 0:  # PR never participates in signal_classification
+                        await reinforce_if_matching(
+                            _db, email["message_id"], "signal_classification",
+                            f"step={step_val},signal={result['signal_type']}",
+                            _kw, email.get("supplier_id"), result["signal_confidence"],
+                        )
+                    await reinforce_if_matching(
+                        _db, email["message_id"], "significance", f"is_significant={bool(is_significant)}",
+                        _kw, email.get("supplier_id"), significance_confidence,
+                    )
 
             except Exception as e:
                 logger.error("[BG-NLP] Email %d enrichment failed: %s", email_id, e)

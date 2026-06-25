@@ -76,6 +76,18 @@ export function EmailCard({ email, isSelected, isOverriding, onCardClick, onCont
         <div className="absolute top-1.5 right-1.5 w-2 h-2 rounded-full pulse-provisional" style={{ backgroundColor: 'var(--amber-alert)' }} />
       )}
 
+      {/* Step-color redesign: marks the specific email that determines its
+          column's current status — i.e. the most recent advances/holds
+          email for that step. Placed top-left (not top-right) so it never
+          collides with the existing isVerified/isProvisional dots above. */}
+      {(email.signalType === 'advances' || email.signalType === 'holds') && (
+        <div
+          className="absolute top-1.5 left-1.5 w-2 h-2 rounded-full"
+          style={{ backgroundColor: email.signalType === 'advances' ? 'var(--green-success)' : 'var(--amber-alert)' }}
+          title={email.signalType === 'advances' ? 'Confirms this step' : 'Hold / postponement signal'}
+        />
+      )}
+
       {email.hasConflict && (
         <div
           className="absolute top-0 right-8 text-micro font-semibold px-1 py-0.5 rounded"

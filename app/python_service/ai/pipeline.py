@@ -136,6 +136,13 @@ Rules:
     }
 
 
+# Stricter than the general 0.6 step-confidence review bar, per design: a
+# wrong "advances"/"holds" call is more costly than a wrong step call, since
+# it flips a whole step's color and stays flipped (by the redesign's sticky-
+# green rule) until something explicitly corrects it.
+SIGNAL_REVIEW_THRESHOLD = 0.75
+
+
 def classify_step_llm(subject: str, body_text: str,
                       sender_role: str = "unknown",
                       has_attachments: bool = False,
@@ -246,11 +253,14 @@ Return ONLY a JSON object:
   "needs_review": true/false,
   "is_significant": true/false,
   "significance_confidence": 0.0 to 1.0,
-  "signal_type": "advances" | "holds" | "neutral"
+  "signal_type": "advances" | "holds" | "neutral",
+  "signal_confidence": 0.0 to 1.0
 }}
 
 Set needs_review=true if: the email content is genuinely ambiguous between two steps,
-mixes multiple topics, or you are not confident which step applies."""
+mixes multiple topics, or you are not confident which step applies.
+Be especially strict with signal_confidence — a wrong "advances" call is more costly than
+a wrong step call, since it flips the step's color and stays flipped until corrected."""
 
     result = generate_json(prompt, temperature=0.1)
     if not result:
@@ -261,15 +271,28 @@ mixes multiple topics, or you are not confident which step applies."""
         step = 0
 
     confidence = result.get("confidence", 0.5)
-    needs_review = result.get("needs_review", False) or confidence < 0.6
 
     signal_type = result.get("signal_type", "neutral")
     if signal_type not in ("advances", "holds", "neutral"):
         signal_type = "neutral"
+    signal_confidence = result.get("signal_confidence", 0.5)
+    if not isinstance(signal_confidence, (int, float)):
+        signal_confidence = 0.5
     if step == 0:
-        # PR never participates in the color system, regardless of what the
-        # LLM returned — enforced here rather than trusted to the prompt.
+        # PR never participates in the color system — this is a hard rule
+        # override, not a probabilistic judgment, so confidence is certain.
         signal_type = "neutral"
+        signal_confidence = 1.0
+
+    # Signal calls get a STRICTER review bar than step calls: a wrong
+    # "advances"/"holds" is stickier and more consequential (flips a whole
+    # column's color and stays flipped, by design, until corrected) than a
+    # wrong step assignment, which is comparatively easy to fix later.
+    needs_review = (
+        result.get("needs_review", False)
+        or confidence < 0.6
+        or (signal_type in ("advances", "holds") and signal_confidence < SIGNAL_REVIEW_THRESHOLD)
+    )
 
     return {
         "suggested_step": step,
@@ -283,6 +306,7 @@ mixes multiple topics, or you are not confident which step applies."""
         "is_significant": result.get("is_significant", True),
         "significance_confidence": result.get("significance_confidence", 0.5),
         "signal_type": signal_type,
+        "signal_confidence": signal_confidence,
     }
 
 

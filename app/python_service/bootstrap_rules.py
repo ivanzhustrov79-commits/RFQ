@@ -46,7 +46,7 @@ def main():
     print("[BOOTSTRAP] Loading high-confidence classified emails...")
     rows = db.execute("""
         SELECT message_id, subject, step_assigned, supplier_id, nlp_result,
-               is_significant, significance_confidence
+               is_significant, significance_confidence, signal_type, signal_confidence
         FROM emails
         WHERE nlp_status IN ('completed', 'manual')
           AND nlp_result IS NOT NULL
@@ -58,9 +58,14 @@ def main():
     pattern_votes = defaultdict(lambda: defaultdict(list))
     # Same idea but for significance: keyword -> is_significant (0/1) -> [message_ids]
     significance_votes = defaultdict(lambda: defaultdict(list))
+    # Signal type is step-SCOPED (the same keyword can mean something totally
+    # different for RFQ vs CI vs Downpayment), so the vote key is
+    # (keyword, step) — NOT keyword alone, unlike the other two passes.
+    signal_votes = defaultdict(lambda: defaultdict(list))
 
     kept = 0
     sig_kept = 0
+    signal_kept = 0
     for row in rows:
         try:
             nlp = json.loads(row["nlp_result"])
@@ -86,8 +91,21 @@ def main():
             for kw in keywords:
                 significance_votes[kw][int(is_sig)].append(row["message_id"])
 
+        # Signal classification: same MIN_CONFIDENCE bar for what counts as a
+        # trustworthy historical example, but the vote is keyed by (keyword,
+        # step) together, and only meaningful for steps 1-3 (PR/step 0 never
+        # participates in the signal system at all, so there's nothing to learn there).
+        signal_conf = row["signal_confidence"]
+        signal_type = row["signal_type"]
+        if (signal_conf is not None and signal_conf >= MIN_CONFIDENCE
+                and signal_type is not None and step is not None and step != 0 and keywords):
+            signal_kept += 1
+            for kw in keywords:
+                signal_votes[(kw, step)][signal_type].append(row["message_id"])
+
     print(f"[BOOTSTRAP] {kept} emails passed step confidence >= {MIN_CONFIDENCE}")
     print(f"[BOOTSTRAP] {sig_kept} emails passed significance confidence >= {MIN_CONFIDENCE}")
+    print(f"[BOOTSTRAP] {signal_kept} emails passed signal confidence >= {MIN_CONFIDENCE} (steps 1-3 only)")
 
     # For each keyword, find the dominant step (if it repeats enough and is consistent)
     seeded = 0
@@ -131,7 +149,9 @@ def main():
         if existing:
             continue
 
-        status = 'active' if (times_confirmed >= 3 and confidence >= 0.7) else 'candidate'
+        status = 'candidate'  # never 'active' directly from pure historical self-consistency \
+        # (migration 009) -- needs BOOST/user verification (record_correction) or\
+        # explicit review (/db/learned-rules/{id}/approve) before it can go live
 
         db.execute("""
             INSERT INTO learned_rules (
@@ -192,7 +212,9 @@ def main():
         if existing:
             continue
 
-        status = 'active' if (times_confirmed >= 3 and confidence >= 0.7) else 'candidate'
+        status = 'candidate'  # never 'active' directly from pure historical self-consistency \
+        # (migration 009) -- needs BOOST/user verification (record_correction) or\
+        # explicit review (/db/learned-rules/{id}/approve) before it can go live
 
         db.execute("""
             INSERT INTO learned_rules (
@@ -213,6 +235,69 @@ def main():
 
     db.commit()
     print(f"[BOOTSTRAP] Seeded {sig_seeded} significance rules ({sig_skipped} skipped for inconsistency)")
+
+    # --- Signal classification bootstrapping: step-SCOPED, unlike the other two ---
+    signal_seeded = 0
+    signal_skipped = 0
+
+    for (keyword, step), votes in signal_votes.items():
+        total_votes = sum(len(v) for v in votes.values())
+        if total_votes < MIN_OCCURRENCES:
+            continue
+
+        best = max(votes.items(), key=lambda kv: len(kv[1]))
+        best_signal_type, best_examples = best
+        agreement_ratio = len(best_examples) / total_votes
+
+        if agreement_ratio < MIN_AGREEMENT:
+            signal_skipped += 1
+            continue
+
+        times_confirmed = len(best_examples)
+        confidence = times_confirmed / (times_confirmed + 1)
+
+        action = f"step={step},signal={best_signal_type}"
+        existing_rows = db.execute("""
+            SELECT id, condition_keywords FROM learned_rules
+            WHERE rule_type='signal_classification' AND action = ?
+        """, (action,)).fetchall()
+
+        existing = None
+        for row in existing_rows:
+            try:
+                stored_keywords = json.loads(row["condition_keywords"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if keyword in stored_keywords:
+                existing = row
+                break
+
+        if existing:
+            continue
+
+        status = 'candidate'  # never 'active' directly from pure historical self-consistency \
+        # (migration 009) -- needs BOOST/user verification (record_correction) or\
+        # explicit review (/db/learned-rules/{id}/approve) before it can go live
+
+        db.execute("""
+            INSERT INTO learned_rules (
+                rule_type, supplier_id, condition_pattern, condition_keywords,
+                action, confidence, times_confirmed, status, source_examples
+            ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            "signal_classification",
+            f"[step={step}] subject contains '{keyword}'",
+            json.dumps([keyword], ensure_ascii=False),
+            action,
+            confidence,
+            times_confirmed,
+            status,
+            json.dumps(best_examples[:10], ensure_ascii=False),
+        ))
+        signal_seeded += 1
+
+    db.commit()
+    print(f"[BOOTSTRAP] Seeded {signal_seeded} signal_classification rules ({signal_skipped} skipped for inconsistency)")
 
     # Show summary
     active = db.execute("SELECT COUNT(*) FROM learned_rules WHERE status='active'").fetchone()[0]

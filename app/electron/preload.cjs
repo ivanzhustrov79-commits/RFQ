@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     listMboxes: () => ipcRenderer.invoke('thunderbird:listMboxes'),
     setSkippedAccounts: (list) => ipcRenderer.invoke('thunderbird:setSkippedAccounts', list),
     listAccounts: () => ipcRenderer.invoke('thunderbird:listAccounts'),
+    syncSupplier: (supplierId) => ipcRenderer.invoke('thunderbird:syncSupplier', supplierId),
   },
   suppliers: {
     list: () => ipcRenderer.invoke('suppliers:list'),

@@ -1460,7 +1460,242 @@ ipcMain.handle('thunderbird:setSyncedPaths', (_event, paths) => {
   console.log('[TB-SYNC] setSyncedPaths received %d paths (auto-discovery active)', curr);
 });
 
+// Toggle-triggered targeted resync — fired when a supplier's sync toggle is
+// switched on. See syncSpecificSupplier's comment for why this is safe to
+// call freely: NLP-queue scope is narrowed to just this supplier + Boss,
+// so it never burns qwen time on the rest of the database.
+ipcMain.handle('thunderbird:syncSupplier', async (_event, supplierId) => {
+  if (!supplierId || typeof supplierId !== 'number') {
+    return { success: false, error: 'supplierId (number) is required' };
+  }
+  try {
+    return await syncSpecificSupplier(supplierId);
+  } catch (err) {
+    console.error('[TB-SYNC] syncSupplier IPC error:', err);
+    return { success: false, error: err.message };
+  }
+});
+
 // Perform full Thunderbird sync + health check
+// ── Sync a single folder: stream-parse its mbox, filter, persist, queue NLP ──
+// Extracted so the SAME logic can be reused by both the standard auto-sync
+// loop and syncSpecificSupplier() (the toggle-triggered targeted resync).
+//
+// Filtering (applied to every email, regardless of which caller invoked this):
+//   PERSIST: kept only if it's tracked-supplier-or-boss. supplierId !== null
+//   already means "matched a known supplier's contact pattern" (that's the
+//   only way supplierId ever gets set), so this naturally excludes the
+//   ~2,000+ emails from untracked senders that used to get stored for no
+//   reason. Boss correspondence is kept too, even though it never carries a
+//   supplierId, since PR-step and Downpayment-Boss detection depend on it.
+//
+//   NLP QUEUE: nlpQueueScope controls how much further this narrows:
+//     - null/undefined (standard auto-sync): queue anyone who passed the
+//       persist filter above (any tracked supplier, or boss) — broad, but
+//       bounded to what's actually relevant.
+//     - a specific supplierId (toggle-triggered resync): queue ONLY emails
+//       matching that exact supplier, or boss — even narrower, so flipping
+//       one supplier's sync toggle never burns qwen time on everyone else's
+//       backlog, even other ALREADY-tracked suppliers.
+//   (Already-completed/manual emails are separately protected from re-
+//   queueing by queue_emails_for_nlp's own status check on the Python side
+//   — this scope only governs which NEWLY-discovered emails get queued.)
+// Folder name fragments to EXCLUDE entirely (case-insensitive substring match).
+// Covers English and Russian trash/junk/spam naming conventions, plus Gmail's
+// special virtual folders. Hoisted to module level (was previously nested
+// inside runThunderbirdSync) so syncSpecificSupplier can reuse the exact
+// same folder-discovery logic — no duplicated/diverging traversal code.
+const EXCLUDED_FOLDER_PATTERNS = [
+  'junk', 'trash', 'spam', 'garbage', 'deleted', 'draft', 'starred', 'all mail',
+  'корзина',      // trash (RU)
+  'удален',       // deleted (RU, covers удаленные/удалённые)
+  'спам',         // spam (RU)
+  'мусор',        // garbage (RU)
+  'черновик',     // drafts (RU)
+  'помечен',      // starred/flagged (RU)
+  'вся почта',    // all mail (RU, Gmail)
+];
+
+function isExcludedFolder(name) {
+  const lower = (name || '').toLowerCase();
+  return EXCLUDED_FOLDER_PATTERNS.some(p => lower.includes(p));
+}
+
+// Recursively collect every leaf folder (one with an actual mbox file) in an account tree
+function collectAllFolders(children, accountName, profileName, acc) {
+  for (const child of (children || [])) {
+    if (isExcludedFolder(child.name)) continue;
+    if (child.path && fs.existsSync(child.path)) {
+      acc.push({
+        syncKey: `${profileName}/${accountName}/${child.path}`,
+        mboxPath: child.path,
+        accountName,
+        folderName: child.name || 'unknown',
+      });
+    }
+    if (child.children && child.children.length) {
+      collectAllFolders(child.children, accountName, profileName, acc);
+    }
+  }
+  return acc;
+}
+
+async function syncOneFolder({ mboxPath, accountName, folderName, getSupplierIdFromAddress, isBossAddress, bossEmails, nlpQueueScope }) {
+  try {
+    const stats = fs.statSync(mboxPath);
+    const sizeMB = Math.round(stats.size / 1024 / 1024);
+
+    const accountEmailLower = (accountName || '').toLowerCase();
+
+    async function handleBatch(emails) {
+      for (const e of emails) {
+        e.isSentByUser = accountEmailLower && e.from.toLowerCase().includes(accountEmailLower);
+        const addressToCheck = e.isSentByUser ? e.to : e.from;
+        e.supplierId = getSupplierIdFromAddress(addressToCheck) || null;
+        e.isBoss = isBossAddress(e.from, bossEmails) || isBossAddress(e.to, bossEmails);
+      }
+
+      // Standard sync-scoping filter: drop anything that's neither a tracked
+      // supplier nor Boss correspondence, BEFORE it ever reaches the DB.
+      const relevant = emails.filter(e => e.supplierId !== null || e.isBoss);
+
+      if (pythonAvailable && relevant.length > 0) {
+        await persistEmailsToDB(relevant, {
+          folderName,
+          accountEmail: accountName,
+          supplierId: null,
+        }).catch(() => {});
+
+        const toQueue = nlpQueueScope
+          ? relevant.filter(e => e.supplierId === nlpQueueScope || e.isBoss)
+          : relevant;
+        if (toQueue.length > 0) {
+          await queueEmailsForBackgroundNLP(toQueue).catch(() => {});
+        }
+      }
+      emails.length = 0; // explicit cleanup hint
+    }
+
+    if (sizeMB > 50) {
+      console.log('[TB-SYNC] Streaming large file: %s (%d MB)', folderName, sizeMB);
+    }
+
+    const totalProcessed = await parseMboxEmailsStreaming(mboxPath, handleBatch, { batchSize: 200 });
+    if (totalProcessed > 0) {
+      console.log('[TB-SYNC] Finished %s: %d emails scanned (%d MB)', folderName, totalProcessed, sizeMB);
+    }
+    return totalProcessed;
+  } catch (err) {
+    console.log('[TB-SYNC] Sync failed for %s: %s', folderName, err.message);
+    return 0;
+  }
+}
+
+// ── Toggle-triggered targeted resync ──
+// Fired when a supplier's sync toggle is switched ON (whether newly added,
+// or an existing tracked supplier that was previously paused). Re-scans
+// every folder the normal way (folder names carry no semantic meaning in
+// this app — see the comment in runThunderbirdSync — so there's no
+// per-supplier folder to scope discovery to), but the NLP-QUEUE step is
+// explicitly narrowed to just this one supplier + Boss, via syncOneFolder's
+// nlpQueueScope parameter. Persistence still uses the normal tracked-
+// supplier-or-boss filter (cheap, keeps the DB consistent across all
+// tracked suppliers) — only the expensive qwen step gets the narrow scope.
+//
+// This is NOT a separate sync mechanism — it's the exact same syncOneFolder
+// used by the standard auto-sync, just parameterized differently. Re-reading
+// already-synced mbox bytes is cheap file I/O; the thing this protects is
+// qwen time, which is what was actually expensive about the original
+// (unscoped) full sync.
+async function syncSpecificSupplier(targetSupplierId) {
+  console.log('[TB-SYNC] Targeted resync starting for supplier_id=%d', targetSupplierId);
+  const t0 = Date.now();
+
+  const result = findThunderbirdProfiles();
+  if (result.error) {
+    console.log('[TB-SYNC] Targeted resync failed (profile scan):', result.error);
+    return { success: false, error: result.error };
+  }
+
+  let supplierPatternMap = {};
+  if (pythonAvailable) {
+    try {
+      const cp = await callPython('/db/supplier-contact-patterns', null, 'GET');
+      for (const p of (cp.patterns || [])) {
+        const sid = p.supplier_id;
+        if (!supplierPatternMap[sid]) supplierPatternMap[sid] = { domains: [], emails: [] };
+        if (p.email_pattern.startsWith('@')) {
+          supplierPatternMap[sid].domains.push(p.email_pattern.slice(1).toLowerCase());
+        } else {
+          supplierPatternMap[sid].emails.push(p.email_pattern.toLowerCase());
+        }
+      }
+    } catch (e) {
+      console.log('[TB-SYNC] Targeted resync: pattern fetch error:', e.message);
+    }
+  }
+
+  let bossEmails = new Set();
+  if (pythonAvailable) {
+    try {
+      const br = await callPython('/db/boss-addresses', null, 'GET');
+      for (const a of (br.addresses || [])) {
+        if (a.email) bossEmails.add(a.email.toLowerCase().trim());
+      }
+    } catch (e) {
+      console.log('[TB-SYNC] Targeted resync: boss fetch error:', e.message);
+    }
+  }
+
+  function extractBareEmail(raw) {
+    if (!raw) return '';
+    const m = raw.match(/<([^>]+)>/);
+    return (m ? m[1] : raw).toLowerCase().trim();
+  }
+  function getSupplierIdFromAddress(raw) {
+    const bare = extractBareEmail(raw);
+    const domain = bare.split('@')[1];
+    for (const [sid, patterns] of Object.entries(supplierPatternMap)) {
+      if (patterns.emails.includes(bare)) return Number(sid);
+      if (domain && patterns.domains.includes(domain)) return Number(sid);
+    }
+    return null;
+  }
+  function isBossAddress(raw, emails) {
+    const bare = extractBareEmail(raw);
+    return bare && emails.has(bare);
+  }
+
+  const foldersToSync = [];
+  for (const profile of (result.profiles || [])) {
+    for (const account of (profile.trees || [])) {
+      const accountName = account.name || '';
+      if (_skippedAccounts.has(accountName) || _skippedAccounts.has(accountName.toLowerCase())) continue;
+      collectAllFolders(account.children, accountName, profile.name, foldersToSync);
+    }
+  }
+  console.log('[TB-SYNC] Targeted resync: scanning %d folders for supplier_id=%d', foldersToSync.length, targetSupplierId);
+
+  let totalScanned = 0;
+  for (const { mboxPath, accountName, folderName } of foldersToSync) {
+    const n = await syncOneFolder({
+      mboxPath, accountName, folderName,
+      getSupplierIdFromAddress, isBossAddress, bossEmails,
+      nlpQueueScope: targetSupplierId, // the narrow scope — this is the whole point
+    });
+    totalScanned += n;
+  }
+
+  console.log('[TB-SYNC] Targeted resync complete for supplier_id=%d: %d emails scanned across %d folders (%dms)',
+    targetSupplierId, totalScanned, foldersToSync.length, Date.now() - t0);
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('thunderbird:syncComplete', { timestamp: new Date().toISOString() });
+  }
+
+  return { success: true, supplierId: targetSupplierId, foldersScanned: foldersToSync.length, emailsScanned: totalScanned };
+}
+
 async function runThunderbirdSync() {
   if (_isScanning) {
     console.log('[TB-SYNC] Scan already in progress, skipping');
@@ -1537,6 +1772,22 @@ async function runThunderbirdSync() {
       }
     }
 
+    // Boss addresses — fetched once per sync run, same as supplier patterns above.
+    // Used to keep internal Boss<->user correspondence flowing through the standard
+    // sync-scoping filter even though Boss isn't a "supplier" (no supplierId match).
+    let bossEmails = new Set();
+    if (pythonAvailable) {
+      try {
+        const br = await callPython('/db/boss-addresses', null, 'GET');
+        for (const a of (br.addresses || [])) {
+          if (a.email) bossEmails.add(a.email.toLowerCase().trim());
+        }
+        console.log('[TB-SYNC] Boss addresses:', [...bossEmails].join(', ') || '(none configured)');
+      } catch (e) {
+        console.log('[TB-SYNC] Boss address fetch error:', e.message);
+      }
+    }
+
     function extractBareEmail(raw) {
       if (!raw) return '';
       const m = raw.match(/<([^>]+)>/);
@@ -1553,45 +1804,15 @@ async function runThunderbirdSync() {
       return null;
     }
 
+    function isBossAddress(raw, bossEmails) {
+      const bare = extractBareEmail(raw);
+      return bare && bossEmails.has(bare);
+    }
+
     // Folder name fragments to EXCLUDE entirely (case-insensitive substring match)
     // Covers English and Russian trash/junk/spam naming conventions, plus Gmail's
     // special virtual folders (All Mail duplicates everything; Starred/Drafts aren't
     // real correspondence).
-    const EXCLUDED_FOLDER_PATTERNS = [
-      'junk', 'trash', 'spam', 'garbage', 'deleted', 'draft', 'starred', 'all mail',
-      'корзина',      // trash (RU)
-      'удален',       // deleted (RU, covers удаленные/удалённые)
-      'спам',         // spam (RU)
-      'мусор',        // garbage (RU)
-      'черновик',     // drafts (RU)
-      'помечен',      // starred/flagged (RU)
-      'вся почта',    // all mail (RU, Gmail)
-    ];
-
-    function isExcludedFolder(name) {
-      const lower = (name || '').toLowerCase();
-      return EXCLUDED_FOLDER_PATTERNS.some(p => lower.includes(p));
-    }
-
-    // Recursively collect every leaf folder (one with an actual mbox file) in an account tree
-    function collectAllFolders(children, accountName, profileName, acc) {
-      for (const child of (children || [])) {
-        if (isExcludedFolder(child.name)) continue;
-        if (child.path && fs.existsSync(child.path)) {
-          acc.push({
-            syncKey: `${profileName}/${accountName}/${child.path}`,
-            mboxPath: child.path,
-            accountName,
-            folderName: child.name || 'unknown',
-          });
-        }
-        if (child.children && child.children.length) {
-          collectAllFolders(child.children, accountName, profileName, acc);
-        }
-      }
-      return acc;
-    }
-
     const foldersToSync = [];
     for (const profile of (result.profiles || [])) {
       for (const account of (profile.trees || [])) {
@@ -1611,57 +1832,11 @@ async function runThunderbirdSync() {
     }
 
     for (const { syncKey, mboxPath, accountName, folderName } of foldersToSync) {
-      try {
-        const stats = fs.statSync(mboxPath);
-        const sizeMB = Math.round(stats.size / 1024 / 1024);
-
-        const accountEmailLower = (accountName || '').toLowerCase();
-
-        // Per-batch handler: tag supplierId, persist, queue for NLP, then let the batch
-        // be garbage collected. Memory stays roughly constant regardless of file size,
-        // since we never hold more than one batch (~200 emails) at a time.
-        async function handleBatch(emails) {
-          for (const e of emails) {
-            e.isSentByUser = accountEmailLower && e.from.toLowerCase().includes(accountEmailLower);
-            const addressToCheck = e.isSentByUser ? e.to : e.from;
-            e.supplierId = getSupplierIdFromAddress(addressToCheck) || null;
-          }
-          if (pythonAvailable) {
-            await persistEmailsToDB(emails, {
-              folderName,
-              accountEmail: accountName,
-              supplierId: null,
-            }).catch(() => {});
-            await queueEmailsForBackgroundNLP(emails).catch(() => {});
-          }
-          emails.length = 0; // explicit cleanup hint
-        }
-
-        if (sizeMB > 50) {
-          console.log('[TB-SYNC] Streaming large file: %s (%d MB)', folderName, sizeMB);
-        }
-
-        // TEMP DIAGNOSTIC: log the exact path string and its stat info right before
-        // parsing, to rule out any path/file mismatch vs our manual standalone tests.
-        if (folderName === 'AP AIR') {
-          console.log('[PATH-DIAG] mboxPath=%s', JSON.stringify(mboxPath));
-          console.log('[PATH-DIAG] path length=%d, char codes of last 10 chars=%s',
-            mboxPath.length, JSON.stringify(mboxPath.slice(-10).split('').map(c => c.charCodeAt(0))));
-          try {
-            const s = fs.statSync(mboxPath);
-            console.log('[PATH-DIAG] stat: size=%d, mtime=%s', s.size, s.mtime.toISOString());
-          } catch (e) {
-            console.log('[PATH-DIAG] statSync FAILED:', e.message);
-          }
-        }
-
-        const totalProcessed = await parseMboxEmailsStreaming(mboxPath, handleBatch, { batchSize: 200 });
-        if (totalProcessed > 0) {
-          console.log('[TB-SYNC] Finished %s: %d emails processed (%d MB)', folderName, totalProcessed, sizeMB);
-        }
-      } catch (err) {
-        console.log('[TB-SYNC] Sync failed for %s: %s', folderName, err.message);
-      }
+      await syncOneFolder({
+        mboxPath, accountName, folderName,
+        getSupplierIdFromAddress, isBossAddress, bossEmails,
+        nlpQueueScope: null, // standard sync: broad-but-bounded (any tracked supplier, or boss)
+      });
     }
 
     // Notify renderer that supplier data may have updated (just refresh counts)
