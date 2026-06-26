@@ -1455,11 +1455,14 @@ async def _nlp_background_worker():
 
     while not _shutting_down:
         try:
-            # Check if Ollama is available
+            # Check if Ollama is available. Wrapped in to_thread so even the
+            # short (5s) network call this makes can never block the event
+            # loop — meaning the rest of the app (sync, Kanban board, every
+            # other endpoint) stays fully responsive even during an outage.
             from ai.ollama_client import is_available
-            if not is_available():
-                logger.debug("[BG-NLP] Ollama not available, skipping")
-                await asyncio.sleep(300)  # Check again in 5 min
+            if not await asyncio.to_thread(is_available):
+                logger.debug("[BG-NLP] Ollama not available, will retry shortly")
+                await asyncio.sleep(30)  # matches CACHE_TTL_SECONDS — always a fresh check, never wasted on stale cache
                 continue
 
             # Get next pending email
